@@ -1,0 +1,7 @@
+pragma cashscript ^0.13.0;
+
+import "./Leaf.cash";
+
+library Mid1 {
+    function m1(int x) returns (int) { return leaf(x) * 2; }
+}

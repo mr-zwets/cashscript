@@ -1,7 +1,21 @@
 grammar CashScript;
 
 sourceFile
-    : pragmaDirective* contractDefinition EOF
+    : pragmaDirective* topLevelDefinition* EOF
+    ;
+
+// A source file is a sequence of imports, top-level constants, libraries and/or a single contract.
+// Order is unconstrained at the grammar level; semantic checks enforce "at most one contract".
+topLevelDefinition
+    : importDirective
+    | constantDefinition
+    | libraryDefinition
+    | contractDefinition
+    ;
+
+// `import "./path.cash";` — copies the imported file's libraries/constants into this file's scope.
+importDirective
+    : 'import' StringLiteral ';'
     ;
 
 pragmaDirective
@@ -26,6 +40,24 @@ versionOperator
 
 contractDefinition
     : 'contract' Identifier parameterList '{' functionDefinition* '}'
+    ;
+
+// A library is a file-level collection of reusable functions and constants that contracts (or other
+// libraries) can import. Every library member function is implicitly `internal` (a library has no
+// spending function), so the `internal` keyword is neither required nor allowed on them.
+libraryDefinition
+    : 'library' Identifier '{' libraryMember* '}'
+    ;
+
+libraryMember
+    : constantDefinition
+    | functionDefinition
+    ;
+
+// A compile-time constant, inlined at every use site. Valid at file top level or inside a library.
+// The initializer must be a constant expression (no introspection / runtime values).
+constantDefinition
+    : typeName 'constant' Identifier '=' expression ';'
     ;
 
 functionDefinition
@@ -291,6 +323,14 @@ NullaryOp
 
 Internal
     : 'internal'
+    ;
+
+Library
+    : 'library'
+    ;
+
+Import
+    : 'import'
     ;
 
 Identifier

@@ -22,6 +22,8 @@ import {
   ExpressionNode,
   SliceNode,
   IntLiteralNode,
+  ImportNode,
+  ConstantDefinitionNode,
 } from './ast/AST.js';
 import { Symbol, SymbolType } from './ast/SymbolTable.js';
 import { Location } from './ast/Location.js';
@@ -310,6 +312,57 @@ export class BitshiftBitcountNegativeError extends CashScriptError {
     bitcount: number,
   ) {
     super(node, `Bitshift bitcount cannot be negative: ${bitcount}`);
+  }
+}
+
+export class ImportResolutionError extends CashScriptError {
+  constructor(
+    public node: ImportNode,
+    message: string,
+  ) {
+    super(node, message);
+  }
+}
+
+export class ImportCycleError extends CashScriptError {
+  constructor(
+    public node: ImportNode,
+    public cycle: string[],
+  ) {
+    super(node, `Circular import detected: ${cycle.join(' -> ')}`);
+  }
+}
+
+export class ConstantDefinitionError extends CashScriptError {
+  constructor(
+    public node: ConstantDefinitionNode,
+    message: string,
+  ) {
+    super(node, message);
+  }
+}
+
+export class ConstantRedefinitionError extends RedefinitionError {
+  constructor(
+    public node: ConstantDefinitionNode,
+  ) {
+    super(node, `Redefinition of constant ${node.name}`);
+  }
+}
+
+export class ConstantNameCollisionError extends CashScriptError {
+  constructor(
+    node: Node,
+    name: string,
+  ) {
+    super(node, `Identifier '${name}' collides with a global constant of the same name`);
+  }
+}
+
+export class MissingContractError extends Error {
+  constructor() {
+    super('No contract definition found to compile');
+    this.name = this.constructor.name;
   }
 }
 

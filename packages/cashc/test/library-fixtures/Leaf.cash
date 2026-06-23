@@ -1,0 +1,5 @@
+pragma cashscript ^0.13.0;
+
+library Leaf {
+    function leaf(int x) returns (int) { return x + 1; }
+}

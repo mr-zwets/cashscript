@@ -1,0 +1,10 @@
+pragma cashscript ^0.13.0;
+
+// Imports a library and calls its functions unqualified. double(5)=10, addOffset(10)=17.
+import "./MathLib.cash";
+
+contract Consumer() {
+    function spend(int x) {
+        require(addOffset(double(x)) == 17);
+    }
+}

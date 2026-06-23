@@ -95,6 +95,46 @@ class ArgIdentifierCounter extends AstTraversal {
   }
 }
 
+// Collects the names of every function called anywhere within a node (used for reachability analysis).
+class CalledFunctionCollector extends AstTraversal {
+  names: string[] = [];
+
+  visitFunctionCall(node: FunctionCallNode): Node {
+    this.names.push(node.identifier.name);
+    return super.visitFunctionCall(node);
+  }
+}
+
+// Returns the subset of `userFunctions` reachable (directly or transitively) from any spending
+// function, preserving the original declaration order. Used to tree-shake unreferenced user functions
+// (notably imported library functions a contract never calls) so they emit no bytecode.
+function reachableFrom(
+  spendingFunctions: FunctionDefinitionNode[],
+  userFunctions: FunctionDefinitionNode[],
+): FunctionDefinitionNode[] {
+  const userFunctionsByName = new Map(userFunctions.map((f) => [f.name, f]));
+  const reachable = new Set<string>();
+  const queue: string[] = [];
+
+  const enqueueCallees = (func: FunctionDefinitionNode): void => {
+    const collector = new CalledFunctionCollector();
+    func.body.accept(collector);
+    collector.names.forEach((name) => {
+      if (userFunctionsByName.has(name) && !reachable.has(name)) {
+        reachable.add(name);
+        queue.push(name);
+      }
+    });
+  };
+
+  spendingFunctions.forEach(enqueueCallees);
+  while (queue.length > 0) {
+    enqueueCallees(userFunctionsByName.get(queue.shift()!)!);
+  }
+
+  return userFunctions.filter((func) => reachable.has(func.name));
+}
+
 // Inline a user function at its call sites (vs OP_DEFINE/OP_INVOKE) only when its body is this small,
 // so splicing never costs more bytes than the funcid-push + OP_INVOKE it replaces. Bytes are the fee,
 // so this targets size, not op-cost. In bytes, not opcodes: a few-opcode body can embed a large
@@ -193,7 +233,7 @@ export default class GenerateTargetTraversalWithLocation extends AstTraversal {
   }
 
   visitSourceFile(node: SourceFileNode): Node {
-    node.contract = this.visit(node.contract) as ContractNode;
+    node.contract = this.visit(node.contract!) as ContractNode;
 
     // Minimally encode output by going Script -> ASM -> Script
     this.output = asmToScript(scriptToAsm(this.output));
@@ -215,12 +255,19 @@ export default class GenerateTargetTraversalWithLocation extends AstTraversal {
     const userFunctions = node.functions.filter((f) => f.isUserFunction);
     const spendingFunctions = node.functions.filter((f) => !f.isUserFunction);
 
-    // Define every user function up front (before any OP_INVOKE). The VM function table persists for
-    // the whole evaluation of this (locking/unlocking/redeem) bytecode, so a body defined here can be
-    // invoked from the spending function and from other already-defined function bodies. Assign each
-    // a sequential VM-number identifier (1, 2, 3, ...). Defining all of them before any invoke also
-    // lets bodies invoke each other regardless of declaration order.
-    this.defineUserFunctions(userFunctions);
+    // Tree-shaking: only define user functions that are actually reachable from a spending function
+    // (directly or transitively). Unreachable helpers — e.g. an imported library function the contract
+    // never calls — are dropped so they cost no bytecode. Reachable functions keep their declaration
+    // order, which (for the field-tower sources) is bottom-up, preserving the callee-before-caller
+    // ordering the inline optimisation relies on.
+    const reachableUserFunctions = reachableFrom(spendingFunctions, userFunctions);
+
+    // Define every reachable user function up front (before any OP_INVOKE). The VM function table
+    // persists for the whole evaluation of this (locking/unlocking/redeem) bytecode, so a body defined
+    // here can be invoked from the spending function and from other already-defined function bodies.
+    // Assign each a sequential VM-number identifier (1, 2, 3, ...). Defining all of them before any
+    // invoke also lets bodies invoke each other regardless of declaration order.
+    this.defineUserFunctions(reachableUserFunctions);
 
     if (spendingFunctions.length === 1) {
       this.visit(spendingFunctions[0]);

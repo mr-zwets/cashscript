@@ -1,0 +1,9 @@
+pragma cashscript ^0.13.0;
+
+// A standalone library: reusable functions + a compile-time constant. Imported by Consumer.cash.
+library MathLib {
+    int constant OFFSET = 7;
+
+    function addOffset(int x) returns (int) { return x + OFFSET; }
+    function double(int x) returns (int) { return x * 2; }
+}

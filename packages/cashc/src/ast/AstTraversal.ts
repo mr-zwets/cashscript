@@ -38,7 +38,9 @@ import AstVisitor from './AstVisitor.js';
 
 export default class AstTraversal extends AstVisitor<Node> {
   visitSourceFile(node: SourceFileNode): Node {
-    node.contract = this.visit(node.contract) as ContractNode;
+    // After dependency resolution `contract` is always populated; the guard keeps this traversal safe
+    // for any intermediate library-only source file (which has no contract).
+    if (node.contract) node.contract = this.visit(node.contract) as ContractNode;
     return node;
   }
 

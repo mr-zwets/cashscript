@@ -5,6 +5,9 @@ import semver from 'semver';
 import {
   Node,
   SourceFileNode,
+  ImportNode,
+  LibraryNode,
+  ConstantDefinitionNode,
   ContractNode,
   ParameterNode,
   VariableDefinitionNode,
@@ -43,6 +46,9 @@ import {
 import { UnaryOperator, BinaryOperator, NullaryOperator } from './Operator.js';
 import type {
   ContractDefinitionContext,
+  ImportDirectiveContext,
+  LibraryDefinitionContext,
+  ConstantDefinitionContext,
   FunctionDefinitionContext,
   VariableDefinitionContext,
   TupleAssignmentContext,
@@ -114,10 +120,68 @@ export default class AstBuilder
       this.processPragma(pragma);
     });
 
-    const contract = this.visit(ctx.contractDefinition()) as ContractNode;
-    const sourceFileNode = new SourceFileNode(contract);
+    const imports: ImportNode[] = [];
+    const constants: ConstantDefinitionNode[] = [];
+    const libraries: LibraryNode[] = [];
+    let contract: ContractNode | undefined;
+
+    ctx.topLevelDefinition_list().forEach((def) => {
+      if (def.importDirective()) {
+        imports.push(this.visit(def.importDirective()) as ImportNode);
+      } else if (def.constantDefinition()) {
+        constants.push(this.visit(def.constantDefinition()) as ConstantDefinitionNode);
+      } else if (def.libraryDefinition()) {
+        libraries.push(this.visit(def.libraryDefinition()) as LibraryNode);
+      } else if (def.contractDefinition()) {
+        if (contract) {
+          throw new ParseError('A source file may define at most one contract', Location.fromCtx(def));
+        }
+        contract = this.visit(def.contractDefinition()) as ContractNode;
+      }
+    });
+
+    const sourceFileNode = new SourceFileNode(contract, libraries, constants, imports);
     sourceFileNode.location = Location.fromCtx(ctx);
     return sourceFileNode;
+  }
+
+  visitImportDirective(ctx: ImportDirectiveContext): ImportNode {
+    const raw = ctx.StringLiteral().getText();
+    const importPath = raw.substring(1, raw.length - 1);
+    const node = new ImportNode(importPath);
+    node.location = Location.fromCtx(ctx);
+    return node;
+  }
+
+  visitConstantDefinition(ctx: ConstantDefinitionContext): ConstantDefinitionNode {
+    const type = parseType(ctx.typeName().getText());
+    const name = ctx.Identifier().getText();
+    const expression = this.visit(ctx.expression()) as ExpressionNode;
+    const node = new ConstantDefinitionNode(type, name, expression);
+    node.location = Location.fromCtx(ctx);
+    return node;
+  }
+
+  visitLibraryDefinition(ctx: LibraryDefinitionContext): LibraryNode {
+    const name = ctx.Identifier().getText();
+    const functions: FunctionDefinitionNode[] = [];
+    const constants: ConstantDefinitionNode[] = [];
+
+    ctx.libraryMember_list().forEach((member) => {
+      if (member.constantDefinition()) {
+        constants.push(this.visit(member.constantDefinition()) as ConstantDefinitionNode);
+      } else if (member.functionDefinition()) {
+        const func = this.visit(member.functionDefinition()) as FunctionDefinitionNode;
+        // Every library member function is implicitly a reusable `internal` function: a library has
+        // no spending function, so they are always lowered to OP_DEFINE/OP_INVOKE.
+        func.isInternal = true;
+        functions.push(func);
+      }
+    });
+
+    const node = new LibraryNode(name, functions, constants);
+    node.location = Location.fromCtx(ctx);
+    return node;
   }
 
   processPragma(ctx: PragmaDirectiveContext): void {

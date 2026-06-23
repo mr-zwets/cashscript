@@ -1,0 +1,9 @@
+pragma cashscript ^0.13.0;
+
+import "./Cycle2.cash";
+
+contract Cycle1() {
+    function spend(int x) {
+        require(c2(x) == 0);
+    }
+}

@@ -1,0 +1,12 @@
+pragma cashscript ^0.13.0;
+
+// Diamond: both Mid1 and Mid2 import Leaf. The resolver must dedupe Leaf so `leaf` is defined once
+// (otherwise a FunctionRedefinitionError). m1(4)=leaf(4)*2=10, m2(4)=leaf(4)+3=8, sum=18.
+import "./Mid1.cash";
+import "./Mid2.cash";
+
+contract Diamond() {
+    function spend(int x) {
+        require(m1(x) + m2(x) == 18);
+    }
+}

@@ -13,10 +13,13 @@ import {
   sourceMapToLocationData,
 } from '@cashscript/utils';
 import fs, { PathLike } from 'fs';
+import path from 'path';
 import { generateArtifact } from './artifact/Artifact.js';
 import { Ast } from './ast/AST.js';
 import AstBuilder from './ast/AstBuilder.js';
 import { ThrowingErrorListener, CashScriptErrorListener, ForwardingErrorListener } from './ast/error-listeners.js';
+import { resolveDependencies } from './semantic/ResolveDependenciesTraversal.js';
+import { MissingContractError } from './Errors.js';
 import GenerateTargetTraversal from './generation/GenerateTargetTraversal.js';
 import CashScriptLexer from './grammar/CashScriptLexer.js';
 import CashScriptParser from './grammar/CashScriptParser.js';
@@ -32,6 +35,9 @@ export const DEFAULT_COMPILER_OPTIONS: CompilerOptions = {
 
 export interface CompileOptions extends CompilerOptions {
   errorListener?: CashScriptErrorListener;
+  // Directory used to resolve relative `import` paths. Set automatically by compileFile; required when
+  // compiling a string that contains imports.
+  basePath?: string;
 }
 
 /**
@@ -43,11 +49,19 @@ export interface CompileOptions extends CompilerOptions {
  * @throws If the source code contains a syntax, semantic, or type error.
  */
 export function compileString(code: string, compilerOptions: CompileOptions = {}): Artifact {
-  const { errorListener, ...artifactCompilerOptions } = compilerOptions;
+  const { errorListener, basePath, ...artifactCompilerOptions } = compilerOptions;
   const mergedCompilerOptions = { ...DEFAULT_COMPILER_OPTIONS, ...artifactCompilerOptions };
 
   // Lexing + parsing
   let ast = parseCode(code, errorListener);
+
+  // Dependency resolution: resolve imports, merge libraries into the contract, inline constants. This
+  // produces a plain single-contract AST that the semantic/codegen passes below consume unchanged.
+  ast = resolveDependencies(ast, basePath, (importedCode) => parseCode(importedCode, errorListener));
+
+  if (!ast.contract) throw new MissingContractError();
+  // Captured here (where the type is narrowed) since constructor parameters are fixed after resolution.
+  const constructorParamLength = ast.contract.parameters.length;
 
   // Semantic analysis
   ast = ast.accept(new SymbolTableTraversal()) as Ast;
@@ -67,8 +81,6 @@ export function compileString(code: string, compilerOptions: CompileOptions = {}
   // Code generation
   const traversal = new GenerateTargetTraversal(mergedCompilerOptions);
   ast = ast.accept(traversal) as Ast;
-
-  const constructorParamLength = ast.contract.parameters.length;
 
   // Bytecode optimisation
   const optimisedBytecodeOld = optimiseBytecodeOld(traversal.output);
@@ -112,7 +124,9 @@ export function compileString(code: string, compilerOptions: CompileOptions = {}
  */
 export function compileFile(codeFile: PathLike, compilerOptions: CompileOptions = {}): Artifact {
   const code = fs.readFileSync(codeFile, { encoding: 'utf-8' });
-  return compileString(code, compilerOptions);
+  // Resolve relative imports against the source file's own directory unless the caller overrides it.
+  const basePath = compilerOptions.basePath ?? path.dirname(codeFile.toString());
+  return compileString(code, { ...compilerOptions, basePath });
 }
 
 export function parseCode(

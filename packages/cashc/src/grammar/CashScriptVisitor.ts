@@ -4,12 +4,17 @@ import {ParseTreeVisitor} from 'antlr4';
 
 
 import { SourceFileContext } from "./CashScriptParser.js";
+import { TopLevelDefinitionContext } from "./CashScriptParser.js";
+import { ImportDirectiveContext } from "./CashScriptParser.js";
 import { PragmaDirectiveContext } from "./CashScriptParser.js";
 import { PragmaNameContext } from "./CashScriptParser.js";
 import { PragmaValueContext } from "./CashScriptParser.js";
 import { VersionConstraintContext } from "./CashScriptParser.js";
 import { VersionOperatorContext } from "./CashScriptParser.js";
 import { ContractDefinitionContext } from "./CashScriptParser.js";
+import { LibraryDefinitionContext } from "./CashScriptParser.js";
+import { LibraryMemberContext } from "./CashScriptParser.js";
+import { ConstantDefinitionContext } from "./CashScriptParser.js";
 import { FunctionDefinitionContext } from "./CashScriptParser.js";
 import { FunctionBodyContext } from "./CashScriptParser.js";
 import { ParameterListContext } from "./CashScriptParser.js";
@@ -72,6 +77,18 @@ export default class CashScriptVisitor<Result> extends ParseTreeVisitor<Result> 
 	 */
 	visitSourceFile?: (ctx: SourceFileContext) => Result;
 	/**
+	 * Visit a parse tree produced by `CashScriptParser.topLevelDefinition`.
+	 * @param ctx the parse tree
+	 * @return the visitor result
+	 */
+	visitTopLevelDefinition?: (ctx: TopLevelDefinitionContext) => Result;
+	/**
+	 * Visit a parse tree produced by `CashScriptParser.importDirective`.
+	 * @param ctx the parse tree
+	 * @return the visitor result
+	 */
+	visitImportDirective?: (ctx: ImportDirectiveContext) => Result;
+	/**
 	 * Visit a parse tree produced by `CashScriptParser.pragmaDirective`.
 	 * @param ctx the parse tree
 	 * @return the visitor result
@@ -107,6 +124,24 @@ export default class CashScriptVisitor<Result> extends ParseTreeVisitor<Result> 
 	 * @return the visitor result
 	 */
 	visitContractDefinition?: (ctx: ContractDefinitionContext) => Result;
+	/**
+	 * Visit a parse tree produced by `CashScriptParser.libraryDefinition`.
+	 * @param ctx the parse tree
+	 * @return the visitor result
+	 */
+	visitLibraryDefinition?: (ctx: LibraryDefinitionContext) => Result;
+	/**
+	 * Visit a parse tree produced by `CashScriptParser.libraryMember`.
+	 * @param ctx the parse tree
+	 * @return the visitor result
+	 */
+	visitLibraryMember?: (ctx: LibraryMemberContext) => Result;
+	/**
+	 * Visit a parse tree produced by `CashScriptParser.constantDefinition`.
+	 * @param ctx the parse tree
+	 * @return the visitor result
+	 */
+	visitConstantDefinition?: (ctx: ConstantDefinitionContext) => Result;
 	/**
 	 * Visit a parse tree produced by `CashScriptParser.functionDefinition`.
 	 * @param ctx the parse tree

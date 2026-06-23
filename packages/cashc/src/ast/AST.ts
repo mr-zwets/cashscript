@@ -23,13 +23,67 @@ export interface Typed {
 
 export class SourceFileNode extends Node {
   constructor(
-    public contract: ContractNode,
+    // The single contract compiled from this file. Optional because a library-only file (imported by
+    // another file) has no contract. `imports`, `libraries` and top-level `constants` are resolved and
+    // merged into `contract` by the dependency-resolution pass *before* any AstVisitor traversal runs,
+    // so downstream passes only ever see a populated `contract`.
+    public contract?: ContractNode,
+    public libraries: LibraryNode[] = [],
+    public constants: ConstantDefinitionNode[] = [],
+    public imports: ImportNode[] = [],
   ) {
     super();
   }
 
   accept<T>(visitor: AstVisitor<T>): T {
     return visitor.visitSourceFile(this);
+  }
+}
+
+// `import "./path.cash";` — a reference to another source file whose libraries/constants are pulled
+// into this file's scope. Resolved (and removed) by the dependency-resolution pass; it is never
+// visited by an AstVisitor, so its accept() is a guard.
+export class ImportNode extends Node {
+  constructor(
+    public path: string,
+  ) {
+    super();
+  }
+
+  accept<T>(): T {
+    throw new Error('ImportNode must be resolved before AST traversal');
+  }
+}
+
+// A compile-time constant (file top-level or library member). Its initializer is folded to a literal
+// and inlined at every use site by the dependency-resolution pass, after which this node is discarded.
+export class ConstantDefinitionNode extends Node implements Named, Typed {
+  constructor(
+    public type: Type,
+    public name: string,
+    public expression: ExpressionNode,
+  ) {
+    super();
+  }
+
+  accept<T>(): T {
+    throw new Error('ConstantDefinitionNode must be inlined before AST traversal');
+  }
+}
+
+// A library: a file-level bag of reusable (implicitly `internal`) functions and constants. Merged
+// into the importing contract by the dependency-resolution pass; never visited by an AstVisitor.
+export class LibraryNode extends Node implements Named {
+  constructor(
+    public name: string,
+    public functions: FunctionDefinitionNode[],
+    public constants: ConstantDefinitionNode[],
+  ) {
+    super();
+  }
+
+  accept<T>(): T {
+    throw new Error('LibraryNode must be merged before AST traversal');
   }
 }
 

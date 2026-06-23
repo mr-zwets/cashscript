@@ -1,0 +1,7 @@
+pragma cashscript ^0.13.0;
+
+import "./Cycle1.cash";
+
+library Cycle2 {
+    function c2(int x) returns (int) { return x; }
+}
