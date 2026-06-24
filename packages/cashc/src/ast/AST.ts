@@ -140,6 +140,10 @@ export class ParameterNode extends Node implements Named, Typed {
   constructor(
     public type: Type,
     public name: string,
+    // Declaration modifiers (e.g. `unused`). An `unused` parameter is exempt from the
+    // unused-variable check — useful for declaring non-functional padding bytes that buy a
+    // larger compute budget without being referenced in the contract logic.
+    public modifiers: string[] = [],
   ) {
     super();
   }

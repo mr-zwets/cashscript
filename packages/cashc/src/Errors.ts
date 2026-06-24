@@ -277,6 +277,15 @@ export class ConstantModificationError extends CashScriptError {
   }
 }
 
+export class InvalidModifierError extends CashScriptError {
+  constructor(
+    node: VariableDefinitionNode | ParameterNode,
+    message: string,
+  ) {
+    super(node, message);
+  }
+}
+
 export class ArrayElementError extends CashScriptError {
   constructor(
     node: ArrayNode,

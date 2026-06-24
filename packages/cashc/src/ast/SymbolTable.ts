@@ -8,6 +8,9 @@ import {
 
 export class Symbol {
   references: IdentifierNode[] = [];
+  // When true, this symbol is exempt from the unused-variable check (set for variables and
+  // parameters declared with the `unused` modifier).
+  ignoreUnused: boolean = false;
   private constructor(
     public name: string,
     public type: Type,
@@ -80,6 +83,8 @@ export class SymbolTable {
       // Only variables are subject to the unused-variable check; user-defined function symbols
       // may legitimately go uncalled (and are reported elsewhere if needed).
       .filter((s) => s.symbolType === SymbolType.VARIABLE)
+      // Symbols explicitly declared `unused` opt out of the check.
+      .filter((s) => !s.ignoreUnused)
       .filter((s) => s.references.length === 0);
   }
 }
