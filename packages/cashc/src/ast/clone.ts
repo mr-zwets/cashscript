@@ -72,7 +72,11 @@ function clone(node: Node, renames: Map<string, string>): Node {
 
   if (node instanceof TupleAssignmentNode) {
     return withLocation(new TupleAssignmentNode(
-      node.targets.map((target) => ({ name: rename(target.name, renames), type: target.type })),
+      node.targets.map((target) => ({
+        name: rename(target.name, renames),
+        type: target.type,
+        isReassignment: target.isReassignment,
+      })),
       clone(node.tuple, renames) as ExpressionNode,
     ), node);
   }

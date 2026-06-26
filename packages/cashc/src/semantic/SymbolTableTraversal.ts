@@ -177,6 +177,23 @@ export default class SymbolTableTraversal extends AstTraversal {
 
   visitTupleAssignment(node: TupleAssignmentNode): Node {
     node.targets.forEach((variable) => {
+      if (variable.isReassignment) {
+        // Reassignment of an existing variable (`x`, no type): resolve its symbol and adopt its
+        // type for the downstream type-check. Do NOT create a new symbol — that would redefine /
+        // shadow the existing one. Register a reference so the variable isn't flagged unused.
+        const existing = this.symbolTables[0].get(variable.name);
+        if (!existing) {
+          const reference = new IdentifierNode(variable.name);
+          reference.location = node.location;
+          throw new UndefinedReferenceError(reference);
+        }
+        variable.type = existing.type;
+        const reference = new IdentifierNode(variable.name);
+        reference.location = node.location;
+        existing.references.push(reference);
+        return;
+      }
+
       const definition = createTupleVariableDefinition(node, variable);
 
       const { name } = variable;
@@ -264,7 +281,9 @@ function createTupleVariableDefinition(
   node: TupleAssignmentNode,
   variable: TupleAssignmentNode['targets'][number],
 ): VariableDefinitionNode {
-  const definition = new VariableDefinitionNode(variable.type, [], variable.name, node.tuple);
+  // Only declaration targets reach here (reassignment targets are handled before this is called),
+  // so `type` is always defined.
+  const definition = new VariableDefinitionNode(variable.type!, [], variable.name, node.tuple);
   definition.location = node.location;
   return definition;
 }

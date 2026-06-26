@@ -180,8 +180,11 @@ export default class TypeCheckTraversal extends AstTraversal {
       }
 
       node.targets.forEach((target, i) => {
-        if (!implicitlyCastable(callReturnTypes[i], target.type)) {
-          const syntheticAssignment = new VariableDefinitionNode(target.type, [], target.name, node.tuple);
+        // target.type is resolved for every target by SymbolTableTraversal before this pass (declared
+        // targets carry their declared type; reassignment targets adopt the existing variable's type).
+        const targetType = target.type!;
+        if (!implicitlyCastable(callReturnTypes[i], targetType)) {
+          const syntheticAssignment = new VariableDefinitionNode(targetType, [], target.name, node.tuple);
           syntheticAssignment.location = node.location;
           throw new AssignTypeError(syntheticAssignment);
         }
@@ -204,7 +207,8 @@ export default class TypeCheckTraversal extends AstTraversal {
     }
 
     const [left, right] = node.targets;
-    const assignmentType = new TupleType(left.type, right.type);
+    // Both target types are resolved by SymbolTableTraversal before this pass (see above).
+    const assignmentType = new TupleType(left.type!, right.type!);
 
     if (!implicitlyCastable(node.tuple.type, assignmentType)) {
       const syntheticAssignment = new VariableDefinitionNode(assignmentType, [], left.name, node.tuple);

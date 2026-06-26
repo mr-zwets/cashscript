@@ -567,12 +567,41 @@ export default class GenerateTargetTraversalWithLocation extends AstTraversal {
   }
 
   visitTupleAssignment(node: TupleAssignmentNode): Node {
-    // The RHS leaves N values on the stack (the last value on top). Replace those N anonymous
-    // entries with the destructuring target names in declared order, so the last target is bound to
-    // the top-of-stack value — matching both the `.split` (N=2) and multi-return-call conventions.
+    // The RHS leaves N values on the stack (the last value on top), matching both the `.split` (N=2)
+    // and multi-return-call conventions.
     node.tuple = this.visit(node.tuple);
-    this.popFromStack(node.targets.length);
-    node.targets.forEach((target) => this.pushToStack(target.name));
+    const n = node.targets.length;
+
+    // Inside a loop or branch the stack layout must be identical at entry and exit, so a target that
+    // reassigns an existing variable (`x`, no type) has to be updated IN PLACE — it cannot move to
+    // the top of the stack. Everywhere else — including a straight-line (scopeDepth 0) reassignment —
+    // binding is a pure stack rename: the N result entries simply take the target names. For a
+    // reassignment that leaves the variable's old slot as a dead duplicate, removed by end-of-scope
+    // cleanup, exactly like a scalar `x = expr` at scopeDepth 0. This is the whole point of the
+    // feature: it replaces the fresh-temp + per-element `emitReplace` rebind workaround with a rename.
+    const scopedReassign = this.scopeDepth > 0 && node.targets.some((target) => target.isReassignment);
+    if (!scopedReassign) {
+      this.popFromStack(n);
+      node.targets.forEach((target) => this.pushToStack(target.name));
+      return node;
+    }
+
+    // Mixing fresh declarations and reassignments in one scoped destructuring would break the
+    // top-down "current target's value is on top" invariant used below, so it is rejected.
+    if (!node.targets.every((target) => target.isReassignment)) {
+      throw new Error(
+        'Mixing fresh declarations and reassignments in a tuple destructuring inside a loop or branch '
+        + 'is not supported; use separate statements.',
+      );
+    }
+
+    // Fold each result into its existing variable's slot, in place, from the top of the result block
+    // downward. After targets[i+1..n-1] are folded, targets[i]'s value is on top, so this mirrors a
+    // sequence of scalar `x = <value-on-top>` reassignments.
+    for (let i = n - 1; i >= 0; i -= 1) {
+      this.emitReplace(this.getStackIndex(node.targets[i].name), node);
+      this.popFromStack();
+    }
     return node;
   }
 

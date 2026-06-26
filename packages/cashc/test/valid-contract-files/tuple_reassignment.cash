@@ -1,0 +1,29 @@
+pragma cashscript ^0.13.0;
+
+// Destructuring into existing variables: a target without a type reassigns an already-declared
+// variable instead of declaring a fresh one. Covers a straight-line reassignment and an in-loop
+// reassignment of loop-carried state (the case that previously needed a fresh-temp + per-element
+// rebind workaround).
+contract TupleReassignment() {
+    function spend(int seed) {
+        int a = seed;
+        int b = seed + 1;
+
+        // straight-line reassignment of both existing variables
+        (a, b) = swap(a, b);
+
+        // mixed: declare c fresh, reassign a (allowed at the top level)
+        (int c, a) = swap(a, b);
+
+        // loop-carried state reassigned in place each iteration
+        for (int i = 0; i < 4; i = i + 1) {
+            (a, b) = swap(a, b);
+        }
+
+        require(a + b + c >= 0);
+    }
+
+    internal function swap(int x, int y) returns (int, int) {
+        return y, x;
+    }
+}

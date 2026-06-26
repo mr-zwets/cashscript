@@ -119,7 +119,10 @@ export default class OutputSourceCodeTraversal extends AstTraversal {
   }
 
   visitTupleAssignment(node: TupleAssignmentNode): Node {
-    const targets = node.targets.map((target) => `${target.type} ${target.name}`).join(', ');
+    // A reassignment target (`x`) has no type; a declaration target prints as `type x`.
+    const targets = node.targets
+      .map((target) => (target.isReassignment ? target.name : `${target.type} ${target.name}`))
+      .join(', ');
     this.addOutput(`${targets} = `, true);
     this.visit(node.tuple);
 
