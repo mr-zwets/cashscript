@@ -20,10 +20,23 @@ contract TupleReassignment() {
             (a, b) = swap(a, b);
         }
 
+        // mixed declaration + reassignment IN A LOOP: the fresh declarations must form a contiguous
+        // block at the front, the loop-carried reassignments trail at the end. The declarations are
+        // renamed in place, the reassignments folded into their existing slots.
+        for (int j = 0; j < 4; j = j + 1) {
+            (int lo, a, b) = step(a, b);
+            require(lo >= 0);
+        }
+
         require(a + b + c >= 0);
     }
 
     internal function swap(int x, int y) returns (int, int) {
         return y, x;
+    }
+
+    // returns a fresh scalar followed by the two updated accumulators
+    internal function step(int x, int y) returns (int, int, int) {
+        return x * x + 1, y, x;
     }
 }

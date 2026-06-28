@@ -83,7 +83,6 @@ export function compileString(code: string, compilerOptions: CompileOptions = {}
   ast = ast.accept(traversal) as Ast;
 
   // Bytecode optimisation
-  const optimisedBytecodeOld = optimiseBytecodeOld(traversal.output);
   const optimisationResult = optimiseBytecode(
     traversal.output,
     sourceMapToLocationData(traversal.sourceMap),
@@ -93,10 +92,18 @@ export function compileString(code: string, compilerOptions: CompileOptions = {}
     constructorParamLength,
   );
 
-  if (scriptToAsm(optimisedBytecodeOld) !== scriptToAsm(optimisationResult.script)) {
-    console.error(scriptToAsm(optimisedBytecodeOld));
-    console.error(scriptToAsm(optimisationResult.script));
-    throw new Error('New bytecode optimisation is not backwards compatible, please report this issue to the CashScript team');
+  // Dev cross-check: the legacy regex/ASM-string optimiser must agree with the new one. It is
+  // O(runs x scriptSize) over a full ASM string and becomes pathologically slow on very large
+  // (e.g. fully-unrolled) contracts, so it is skipped past a size threshold (and via env). The
+  // shipped artifact always uses optimisationResult; this guard only affects the self-check.
+  const OPT_COMPAT_CHECK_MAX = 15000;
+  if (process.env.CASHC_SKIP_OPT_COMPAT !== '1' && traversal.output.length <= OPT_COMPAT_CHECK_MAX) {
+    const optimisedBytecodeOld = optimiseBytecodeOld(traversal.output);
+    if (scriptToAsm(optimisedBytecodeOld) !== scriptToAsm(optimisationResult.script)) {
+      console.error(scriptToAsm(optimisedBytecodeOld));
+      console.error(scriptToAsm(optimisationResult.script));
+      throw new Error('New bytecode optimisation is not backwards compatible, please report this issue to the CashScript team');
+    }
   }
 
   // Attach debug information

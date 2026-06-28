@@ -586,21 +586,42 @@ export default class GenerateTargetTraversalWithLocation extends AstTraversal {
       return node;
     }
 
-    // Mixing fresh declarations and reassignments in one scoped destructuring would break the
-    // top-down "current target's value is on top" invariant used below, so it is rejected.
-    if (!node.targets.every((target) => target.isReassignment)) {
+    // Mixed declarations + reassignments are supported as long as every reassignment target sits
+    // ABOVE every declaration target in the result block — i.e. the declarations form a contiguous
+    // block at the BOTTOM. That is the natural layout for a multi-return that yields fresh values
+    // followed by the new loop accumulator, e.g.
+    //   (int c0,int c1,..,int c5, Rx,Ry,Rz) = pointDouble(..)
+    // The trailing reassignment block is folded into the existing slots in place (top-down, so each
+    // target's value is on top when processed); the leading declaration block is then simply renamed
+    // in its existing slots — identical to declaring fresh loop-locals, cleaned up at end of scope.
+    // An interleaving where a declaration is shallower than a reassignment would break the "current
+    // value is on top" invariant and is rejected.
+    const firstReassign = node.targets.findIndex((target) => target.isReassignment);
+    const lastDeclaration = node.targets.reduce(
+      (acc, target, i) => (target.isReassignment ? acc : i),
+      -1,
+    );
+    if (lastDeclaration > firstReassign) {
       throw new Error(
-        'Mixing fresh declarations and reassignments in a tuple destructuring inside a loop or branch '
-        + 'is not supported; use separate statements.',
+        'In a tuple destructuring inside a loop or branch, all reassignment targets must come after '
+        + 'every declaration target (declarations must form a contiguous block at the end); '
+        + 'reorder the targets to match or use separate statements.',
       );
     }
 
-    // Fold each result into its existing variable's slot, in place, from the top of the result block
-    // downward. After targets[i+1..n-1] are folded, targets[i]'s value is on top, so this mirrors a
+    // Fold the trailing reassignment block (targets[firstReassign..n-1]) into the existing variable
+    // slots, top-down. After targets[i+1..n-1] are folded, targets[i]'s value is on top, mirroring a
     // sequence of scalar `x = <value-on-top>` reassignments.
-    for (let i = n - 1; i >= 0; i -= 1) {
+    for (let i = n - 1; i >= firstReassign; i -= 1) {
       this.emitReplace(this.getStackIndex(node.targets[i].name), node);
       this.popFromStack();
+    }
+
+    // The leading declaration values now occupy the top `firstReassign` stack entries
+    // (stack[0] = targets[firstReassign - 1], .., stack[firstReassign - 1] = targets[0]). Rename them
+    // in place — no opcodes — so the result slots become the freshly declared loop-locals.
+    for (let s = 0; s < firstReassign; s += 1) {
+      this.stack[s] = node.targets[firstReassign - 1 - s].name;
     }
     return node;
   }
