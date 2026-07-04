@@ -27,6 +27,7 @@ import {
   ImportResolver,
   resolveDependencies,
 } from './dependency-resolution.js';
+import { sinkDefinitions } from './def-sinking.js';
 import GenerateTargetTraversal from './generation/GenerateTargetTraversal.js';
 import SymbolTableTraversal from './semantic/SymbolTableTraversal.js';
 import TypeCheckTraversal from './semantic/TypeCheckTraversal.js';
@@ -88,6 +89,10 @@ export interface InternalCompilerOptions extends CompilerOptions {
   // ASM-regex optimiser and compares the results. The check is also skipped automatically
   // for large scripts, where the legacy optimiser's quadratic cost would dominate compile time.
   disableOptimisationCrossCheck?: boolean;
+  // Skip def-sinking. Under `optimizeFor: 'size'`, definitions move down to just before their
+  // first use when that shrinks the bytecode (the compiler keeps the smaller of the sunk and
+  // unsunk compiles). This flag is for tools that need the source-ordered compile as input.
+  disableDefSinking?: boolean;
 }
 
 export function compileStringInternal(
@@ -114,8 +119,32 @@ function compileCode(
   resolver: ImportResolver,
   compilerOptions: CompileOptions & InternalCompilerOptions,
 ): Artifact {
+  const optimizeFor = compilerOptions.optimizeFor ?? DEFAULT_COMPILER_OPTIONS.optimizeFor;
+  if (optimizeFor !== 'size' || compilerOptions.disableDefSinking) {
+    return compileImpl(code, resolver, compilerOptions, false);
+  }
+
+  // Def-sinking helps most contracts but can cost bytes on some, so the 'size' objective
+  // compiles both variants and keeps the smaller one (the sunk one on a tie).
+  const sunk = compileImpl(code, resolver, compilerOptions, true);
+  const unsunk = compileImpl(code, resolver, compilerOptions, false);
+  const compiledBytes = (artifact: Artifact): number => artifact.debug?.bytecode.length ?? artifact.bytecode.length;
+  return compiledBytes(sunk) <= compiledBytes(unsunk) ? sunk : unsunk;
+}
+
+function compileImpl(
+  code: string,
+  resolver: ImportResolver,
+  compilerOptions: CompileOptions & InternalCompilerOptions,
+  sinkDefs: boolean,
+): Artifact {
   const {
-    errorListener, disableInlining, disableOptimisationCrossCheck, ...artifactCompilerOptions
+    errorListener, disableInlining, disableOptimisationCrossCheck,
+    // consumed in compileCode (which picks the sunk or unsunk compile); destructured here only to
+    // keep it out of the serialized artifact options
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    disableDefSinking,
+    ...artifactCompilerOptions
   } = compilerOptions;
   const mergedCompilerOptions = { ...DEFAULT_COMPILER_OPTIONS, ...artifactCompilerOptions };
 
@@ -129,6 +158,11 @@ function compileCode(
   // Runs before semantic analysis so the introduced locals get symbols like any other variable.
   if (mergedCompilerOptions.optimizeFor === 'size') {
     ast = hoistRepeatedConstants(ast) as Ast;
+  }
+
+  // Sink variable definitions to just before their first use
+  if (sinkDefs) {
+    ast = sinkDefinitions(ast) as Ast;
   }
 
   if (!ast.contract) throw new MissingContractError();
