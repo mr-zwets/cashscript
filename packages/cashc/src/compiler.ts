@@ -28,6 +28,7 @@ import {
 } from './dependency-resolution.js';
 import { inlineConstants } from './constant-folding.js';
 import { hoistRepeatedConstants } from './constant-hoisting.js';
+import { sinkDefinitions } from './def-sinking.js';
 import GenerateTargetTraversal from './generation/GenerateTargetTraversal.js';
 import SymbolTableTraversal from './semantic/SymbolTableTraversal.js';
 import TypeCheckTraversal from './semantic/TypeCheckTraversal.js';
@@ -92,6 +93,25 @@ function compileCode(
   resolver: ImportResolver,
   compilerOptions: CompileOptions,
 ): Artifact {
+  const optimizeFor = compilerOptions.optimizeFor ?? DEFAULT_COMPILER_OPTIONS.optimizeFor;
+  if (optimizeFor !== 'size' || compilerOptions.disableDefSinking) {
+    return compileImpl(code, resolver, compilerOptions, false);
+  }
+
+  // Def-sinking helps most contracts but can cost bytes on some, so the 'size' objective
+  // compiles both variants and keeps the smaller one (the sunk one on a tie).
+  const sunk = compileImpl(code, resolver, compilerOptions, true);
+  const unsunk = compileImpl(code, resolver, compilerOptions, false);
+  const compiledBytes = (artifact: Artifact): number => artifact.debug?.bytecode.length ?? artifact.bytecode.length;
+  return compiledBytes(sunk) <= compiledBytes(unsunk) ? sunk : unsunk;
+}
+
+function compileImpl(
+  code: string,
+  resolver: ImportResolver,
+  compilerOptions: CompileOptions,
+  sinkDefs: boolean,
+): Artifact {
   const { errorListener, ...artifactCompilerOptions } = compilerOptions;
   const mergedCompilerOptions = { ...DEFAULT_COMPILER_OPTIONS, ...artifactCompilerOptions };
 
@@ -107,6 +127,11 @@ function compileCode(
   // Under the 'size' objective, bind repeated in-body literals to locals (see CompilerOptions)
   if (mergedCompilerOptions.optimizeFor === 'size') {
     ast = hoistRepeatedConstants(ast) as Ast;
+  }
+
+  // Sink variable definitions to just before their first use
+  if (sinkDefs) {
+    ast = sinkDefinitions(ast) as Ast;
   }
 
   if (!ast.contract) throw new MissingContractError();

@@ -8,6 +8,10 @@ export interface CompilerOptions {
   // ASM-regex optimiser and compares the results. The check is also skipped automatically
   // for large scripts, where the legacy optimiser's quadratic cost would dominate compile time.
   disableOptimisationCrossCheck?: boolean;
+  // Skip def-sinking. Under `optimizeFor: 'size'`, definitions move down to just before their
+  // first use when that shrinks the bytecode (the compiler keeps the smaller of the sunk and
+  // unsunk compiles). This flag is for tools that need the source-ordered compile as input.
+  disableDefSinking?: boolean;
   // The optimisation objective for decisions that trade bytecode size against op-cost.
   // 'size' minimises bytecode bytes (e.g. binds a literal repeated within one function body to a
   // local, so later uses are ~2-byte stack picks instead of repeated pushes: ~-30 bytes per
