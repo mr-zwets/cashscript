@@ -27,6 +27,7 @@ import {
   resolveDependencies,
 } from './dependency-resolution.js';
 import { sinkDefinitions } from './def-sinking.js';
+import { applyStackRescheduling } from './stack-rescheduling.js';
 import GenerateTargetTraversal from './generation/GenerateTargetTraversal.js';
 import { FoldGlobalConstantsTraversal } from './semantic/FoldGlobalConstantsTraversal.js';
 import SymbolTableTraversal from './semantic/SymbolTableTraversal.js';
@@ -208,7 +209,7 @@ function compileImpl(
   ast = ast.accept(traversal) as Ast;
 
   // Bytecode optimisation
-  const optimisationResult = optimiseBytecode(
+  let optimisationResult = optimiseBytecode(
     traversal.output,
     sourceMapToLocationData(traversal.sourceMap),
     traversal.consoleLogs,
@@ -218,13 +219,27 @@ function compileImpl(
     constructorParamLength,
   );
 
+  // Stack rescheduling (opt-in): re-derive straight-line evaluation schedules from the
+  // dataflow DAG, ranked by the optimizeFor objective. Restricted to single-function
+  // contracts (a function selector makes the entry stack depth path-dependent, which the
+  // block model does not represent).
+  let frames = traversal.frames;
+  if (mergedCompilerOptions.rescheduleStacks && ast.contract!.functions.length === 1) {
+    ({ result: optimisationResult, frames } = applyStackRescheduling(optimisationResult, frames, {
+      arities: traversal.definedFunctionArities,
+      mainInArity: ast.contract!.functions[0].parameters.length + constructorParamLength,
+      objective: mergedCompilerOptions.optimizeFor ?? 'opcost',
+      constructorParamLength,
+    }));
+  }
+
   const debug = {
     bytecode: binToHex(scriptToBytecode(optimisationResult.script)),
     sourceMap: generateSourceMap(optimisationResult.locationData),
     logs: optimisationResult.logs,
     requires: optimisationResult.requires,
     sourceTags: generateSourceTags(optimisationResult.sourceTags) || undefined,
-    functions: traversal.frames.length > 0 ? traversal.frames : undefined,
+    functions: frames.length > 0 ? frames : undefined,
     inlineRanges: generateInlineRanges(optimisationResult.inlineRanges) || undefined,
   };
 
