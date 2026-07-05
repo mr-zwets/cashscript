@@ -29,6 +29,7 @@ import {
 import { inlineConstants } from './constant-folding.js';
 import { hoistRepeatedConstants } from './constant-hoisting.js';
 import { sinkDefinitions } from './def-sinking.js';
+import { applyStackRescheduling } from './stack-rescheduling.js';
 import GenerateTargetTraversal from './generation/GenerateTargetTraversal.js';
 import SymbolTableTraversal from './semantic/SymbolTableTraversal.js';
 import TypeCheckTraversal from './semantic/TypeCheckTraversal.js';
@@ -155,7 +156,7 @@ function compileImpl(
   ast = ast.accept(traversal) as Ast;
 
   // Bytecode optimisation
-  const optimisationResult = optimiseBytecode(
+  let optimisationResult = optimiseBytecode(
     traversal.output,
     sourceMapToLocationData(traversal.sourceMap),
     traversal.consoleLogs,
@@ -178,6 +179,21 @@ function compileImpl(
     }
   }
 
+  // Stack rescheduling (opt-in): re-derive straight-line evaluation schedules from the
+  // dataflow DAG, ranked by the optimizeFor objective. Runs after the legacy-optimiser
+  // cross-check (which compares pre-reschedule outputs) and is restricted to
+  // single-function contracts (a function selector makes the entry stack depth
+  // path-dependent, which the block model does not represent).
+  let frames = traversal.frames;
+  if (mergedCompilerOptions.rescheduleStacks && ast.contract!.functions.length === 1) {
+    ({ result: optimisationResult, frames } = applyStackRescheduling(optimisationResult, frames, {
+      arities: traversal.definedFunctionArities,
+      mainInArity: ast.contract!.functions[0].parameters.length + constructorParamLength,
+      objective: mergedCompilerOptions.optimizeFor ?? 'opcost',
+      constructorParamLength,
+    }));
+  }
+
   // Attach debug information
   const sourceTags = generateSourceTags(optimisationResult.sourceTags);
   const debug = {
@@ -186,7 +202,7 @@ function compileImpl(
     logs: optimisationResult.logs,
     requires: optimisationResult.requires,
     ...(sourceTags ? { sourceTags } : {}),
-    ...(traversal.frames.length > 0 ? { functions: traversal.frames } : {}),
+    ...(frames.length > 0 ? { functions: frames } : {}),
   };
 
   const fingerprint = computeBytecodeFingerprintWithConstructorArgs(optimisationResult.script, constructorParamLength);

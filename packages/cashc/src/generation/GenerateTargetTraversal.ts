@@ -102,6 +102,10 @@ export default class GenerateTargetTraversal extends AstTraversal {
   // populated for recursive/cyclic calls, where the callee is still being compiled when its call is
   // emitted. Shared with body sub-traversals.
   invokedFunctions: Set<string> = new Set();
+  // Stack arity (parameter/return counts) of every OP_DEFINE'd function, keyed by its
+  // functionId — consumed by post-codegen passes (stack rescheduling) that need OP_INVOKE
+  // stack effects without re-deriving them from the bytecode.
+  definedFunctionArities: Map<number, { in: number; out: number }> = new Map();
   // Depth of nested user-function-call argument staging (see stageUserFunctionArguments).
   private userCallArgDepth = 0;
   // Per-variable occurrence counts across the outermost call's whole argument tree. Names appearing
@@ -209,6 +213,7 @@ export default class GenerateTargetTraversal extends AstTraversal {
       if (optimisedBody === undefined) return; // inlined: no OP_DEFINE
       const { functionId } = node.symbolTable!.getFromThis(func.name)!;
       this.pushDebugFrame(func, optimisedBody, functionId!);
+      this.definedFunctionArities.set(functionId!, { in: func.parameters.length, out: func.returnTypes?.length ?? 0 });
       const locationData = { location: func.location, positionHint: PositionHint.START };
       this.emit(scriptToBytecode(optimisedBody.script), locationData); // <function_body_bytes>
       this.emit(encodeInt(BigInt(functionId!)), locationData); // <function_identifier>
