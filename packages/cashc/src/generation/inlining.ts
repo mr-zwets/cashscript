@@ -1,5 +1,6 @@
 import {
   encodeInt,
+  OptimizationTarget,
   OptimiseBytecodeResult,
   Script,
   scriptToBytecode,
@@ -41,11 +42,33 @@ export const shouldInline = (
   }
 
   const callCount = reachableCalls.filter((call) => call.identifier.symbol === symbol).length;
-  return isWorthInlining(nextFunctionId, optimisedResult.script, callCount);
+  return isWorthInlining(nextFunctionId, optimisedResult.script, callCount, compilerOptions.optimizeFor);
 };
 
-function isWorthInlining(candidateFunctionId: number, bodyScript: Script, callCount: number): boolean {
+// Op-cost accounting (CHIP-2021-05 VM limits): every evaluated instruction costs a base 100 and
+// stack pushes add 1 per pushed byte, so for a body of B bytes with a 1-byte funcid, sharing pays
+// <body push> <id push> OP_DEFINE = 301 + 2B once per spend (OP_DEFINE re-prices the body's
+// stack-pushed bytes) plus <id push> OP_INVOKE = 201 per call, while an inlined body executes at
+// identical cost to an invoked one. Inlining therefore wins on op-cost at EVERY body size and use
+// count — this bound is not an op-cost break-even but a byte-bloat guardrail (the op budget comes
+// from unlocking bytes, but locking bytes still cost fees and count against script size limits):
+// each call site of an inlined body costs B bytes instead of the ~2-byte invoke site. 6 is the
+// byte model's break-even at two call sites (2B <= B + 6, with a 1-byte id), so any body the byte
+// model would inline at two uses stays inlined at every use count, capping the regression at
+// ~4 bytes per additional call site. Loop-resident bodies are still excluded above: stepping a
+// skipped inlined body every iteration costs 100 per opcode, which quickly dwarfs the 201/call
+// invoke saving.
+const OPCOST_INLINE_MAX_BODY_BYTES = 6;
+
+function isWorthInlining(
+  candidateFunctionId: number,
+  bodyScript: Script,
+  callCount: number,
+  optimizeFor?: OptimizationTarget,
+): boolean {
   const bodyBytes = scriptToBytecode(bodyScript).length;
+  if (optimizeFor !== 'size' && bodyBytes <= OPCOST_INLINE_MAX_BODY_BYTES) return true;
+
   const idBytes = scriptToBytecode([encodeInt(BigInt(candidateFunctionId))]).length;
 
   const bytesWhenDefined = bodyBytes + idBytes + 1 + callCount * (idBytes + 1);
