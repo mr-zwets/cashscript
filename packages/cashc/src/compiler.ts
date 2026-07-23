@@ -35,10 +35,14 @@ import EnsureFunctionsSafeTraversal from './semantic/EnsureFunctionsSafeTraversa
 import InjectLocktimeGuardTraversal from './semantic/InjectLocktimeGuardTraversal.js';
 import DeadCodeEliminationTraversal from './semantic/DeadCodeEliminationTraversal.js';
 import { LowerGlobalConstantsTraversal } from './semantic/LowerGlobalConstantsTraversal.js';
+import { hoistRepeatedConstants } from './constant-hoisting.js';
 
 export const DEFAULT_COMPILER_OPTIONS: CompilerOptions = {
   enforceFunctionParameterTypes: true,
   enforceLocktimeGuard: true,
+  // recorded explicitly so artifacts always state the objective they were compiled under
+  // (see CompilerOptions in @cashscript/utils for the size/opcost trade-off)
+  optimizeFor: 'opcost',
 };
 
 // Above this unoptimised op-count the legacy-optimiser cross-check is skipped automatically
@@ -120,6 +124,13 @@ function compileCode(
   checkVersionConstraints(ast.pragmas);
 
   ast = resolveDependencies(ast, resolver, errorListener) as Ast;
+
+  // Under the 'size' objective, bind repeated in-body literals to locals (see CompilerOptions).
+  // Runs before semantic analysis so the introduced locals get symbols like any other variable.
+  if (mergedCompilerOptions.optimizeFor === 'size') {
+    ast = hoistRepeatedConstants(ast) as Ast;
+  }
+
   if (!ast.contract) throw new MissingContractError();
 
   const constructorParamLength = ast.contract.parameters.length;
