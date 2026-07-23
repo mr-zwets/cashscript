@@ -101,6 +101,10 @@ export default class GenerateTargetTraversal extends AstTraversal {
   private constructorParameterCount: number;
   inlineRanges: InlineRange[] = [];
 
+  // Tracks right-to-left argument staging for user function calls (see stageUserFunctionArguments)
+  private userCallArgDepth = 0;
+  private callArgNameCounts: Map<string, number> | null = null;
+
   constructor(private compilerOptions: InternalCompilerOptions) {
     super();
   }
@@ -253,11 +257,9 @@ export default class GenerateTargetTraversal extends AstTraversal {
     bodyTraversal.currentFunction = node;
     bodyTraversal.constructorParameterCount = 0;
 
-    // Seed the stack with parameters in reverse order so the last parameter is on top
-    // (similar to how builtin functions work)
-    for (let i = node.parameters.length - 1; i >= 0; i -= 1) {
-      bodyTraversal.visit(node.parameters[i]);
-    }
+    // Seed the stack with the first parameter on top, matching the right-to-left argument staging
+    // at call sites (see stageUserFunctionArguments)
+    node.parameters.forEach((parameter) => bodyTraversal.visit(parameter));
     bodyTraversal.dropUnusedParameters(node.parameters);
 
     bodyTraversal.visit(node.body);
@@ -834,7 +836,12 @@ export default class GenerateTargetTraversal extends AstTraversal {
     }
 
     const symbol = node.identifier.symbol!;
-    node.parameters = this.visitList(node.parameters);
+
+    if (symbol.definition instanceof FunctionDefinitionNode) {
+      this.stageUserFunctionArguments(node);
+    } else {
+      node.parameters = this.visitList(node.parameters);
+    }
 
     const startIp = this.output.length + this.constructorParameterCount;
     const endIp = startIp + symbol.bytecode!.length - 1;
@@ -854,6 +861,29 @@ export default class GenerateTargetTraversal extends AstTraversal {
     for (let i = 0; i < returnValueCount; i += 1) this.pushToStack('(value)');
 
     return node;
+  }
+
+  // User function arguments are staged right-to-left so the first argument ends up on top of the
+  // stack (the layout the function body is compiled against). With arguments that are variables in
+  // declaration order, the emitted ROLLs then cancel to nothing in the optimiser, so a typical call
+  // costs zero staging instructions. Because reversed emission breaks the textual final-use order,
+  // a variable is only allowed to ROLL when it appears exactly once across the whole argument tree
+  // (see isOpRoll); everything else stays a PICK.
+  private stageUserFunctionArguments(node: FunctionCallNode): void {
+    const isOutermostCall = this.userCallArgDepth === 0;
+    if (isOutermostCall) {
+      const counter = new ArgIdentifierCounter();
+      node.parameters.forEach((argument) => counter.visit(argument));
+      this.callArgNameCounts = counter.counts;
+    }
+
+    this.userCallArgDepth += 1;
+    for (let i = node.parameters.length - 1; i >= 0; i -= 1) {
+      node.parameters[i] = this.visit(node.parameters[i]);
+    }
+    this.userCallArgDepth -= 1;
+
+    if (isOutermostCall) this.callArgNameCounts = null;
   }
 
   visitMultiSig(node: FunctionCallNode): Node {
@@ -1049,7 +1079,13 @@ export default class GenerateTargetTraversal extends AstTraversal {
   }
 
   isOpRoll(node: IdentifierNode): boolean {
-    return this.currentFunction.opRolls.get(node.name) === node && this.scopeDepth === 0;
+    if (this.currentFunction.opRolls.get(node.name) !== node || this.scopeDepth !== 0) return false;
+
+    // Inside a user function call's argument list, only variables that appear exactly once across
+    // the whole argument tree may ROLL (see stageUserFunctionArguments)
+    if (this.userCallArgDepth > 0) return this.callArgNameCounts?.get(node.name) === 1;
+
+    return true;
   }
 
   visitBoolLiteral(node: BoolLiteralNode): Node {
@@ -1073,6 +1109,27 @@ export default class GenerateTargetTraversal extends AstTraversal {
   visitHexLiteral(node: HexLiteralNode): Node {
     this.emit(node.value, { location: node.location, positionHint: PositionHint.START });
     this.pushToStack('(value)');
+    return node;
+  }
+}
+
+// Counts identifier reads across a user function call's whole argument tree. Callee identifiers
+// are not stack-variable reads, so only the call arguments are counted.
+class ArgIdentifierCounter extends AstTraversal {
+  counts: Map<string, number> = new Map();
+
+  visitIdentifier(node: IdentifierNode): Node {
+    this.counts.set(node.name, (this.counts.get(node.name) ?? 0) + 1);
+    return node;
+  }
+
+  visitFunctionCall(node: FunctionCallNode): Node {
+    node.parameters = this.visitList(node.parameters);
+    return node;
+  }
+
+  visitInstantiation(node: InstantiationNode): Node {
+    node.parameters = this.visitList(node.parameters);
     return node;
   }
 }
