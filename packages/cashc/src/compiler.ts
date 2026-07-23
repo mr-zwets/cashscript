@@ -36,10 +36,14 @@ import EnsureFunctionsSafeTraversal from './semantic/EnsureFunctionsSafeTraversa
 import InjectLocktimeGuardTraversal from './semantic/InjectLocktimeGuardTraversal.js';
 import DeadCodeEliminationTraversal from './semantic/DeadCodeEliminationTraversal.js';
 import { LowerGlobalConstantsTraversal } from './semantic/LowerGlobalConstantsTraversal.js';
+import { hoistRepeatedConstants } from './constant-hoisting.js';
 
 export const DEFAULT_COMPILER_OPTIONS: CompilerOptions = {
   enforceFunctionParameterTypes: true,
   enforceLocktimeGuard: true,
+  // recorded explicitly so artifacts always state the objective they were compiled under
+  // (see CompilerOptions in @cashscript/utils for the size/opcost trade-off)
+  optimizeFor: 'opcost',
 };
 
 export interface CompileOptions extends CompilerOptions {
@@ -82,6 +86,10 @@ export const compileFile: (codeFile: PathLike, compilerOptions?: CompileOptions)
 
 export interface InternalCompilerOptions extends CompilerOptions {
   disableInlining?: boolean;
+  // Skip constant hoisting. Under `optimizeFor: 'size'`, repeated in-body literals are bound to
+  // locals when that shrinks the bytecode (the compiler keeps the hoisted compile only when it
+  // is strictly smaller). This flag is for tools that need the literal-shaped compile as input.
+  disableConstantHoisting?: boolean;
 }
 
 export function compileStringInternal(
@@ -108,7 +116,33 @@ function compileCode(
   resolver: ImportResolver,
   compilerOptions: CompileOptions & InternalCompilerOptions,
 ): Artifact {
-  const { errorListener, warningListener, disableInlining, ...artifactCompilerOptions } = compilerOptions;
+  const optimizeFor = compilerOptions.optimizeFor ?? DEFAULT_COMPILER_OPTIONS.optimizeFor;
+  if (optimizeFor !== 'size' || compilerOptions.disableConstantHoisting) {
+    return compileImpl(code, resolver, compilerOptions, false);
+  }
+
+  // Hoisting helps most contracts but can cost bytes on some, so the 'size' objective compiles
+  // both variants and keeps the hoisted compile only when it is strictly smaller.
+  const hoisted = compileImpl(code, resolver, compilerOptions, true);
+  const unhoisted = compileImpl(code, resolver, compilerOptions, false);
+  const compiledBytes = (artifact: Artifact): number => artifact.debug?.bytecode.length ?? artifact.bytecode.length;
+  return compiledBytes(hoisted) < compiledBytes(unhoisted) ? hoisted : unhoisted;
+}
+
+function compileImpl(
+  code: string,
+  resolver: ImportResolver,
+  compilerOptions: CompileOptions & InternalCompilerOptions,
+  hoistConstants: boolean,
+): Artifact {
+  const {
+    errorListener, warningListener, disableInlining,
+    // consumed in compileCode (which picks the hoisted or unhoisted compile); destructured here
+    // only to keep it out of the serialized artifact options
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    disableConstantHoisting,
+    ...artifactCompilerOptions
+  } = compilerOptions;
   const mergedCompilerOptions = { ...DEFAULT_COMPILER_OPTIONS, ...artifactCompilerOptions };
 
   // Lexing + parsing
@@ -116,6 +150,13 @@ function compileCode(
   checkVersionConstraints(ast.pragmas);
 
   ast = resolveDependencies(ast, resolver, errorListener) as Ast;
+
+  // Under the 'size' objective, bind repeated in-body literals to locals (see CompilerOptions).
+  // Runs before semantic analysis so the introduced locals get symbols like any other variable.
+  if (hoistConstants) {
+    ast = hoistRepeatedConstants(ast) as Ast;
+  }
+
   if (!ast.contract) throw new MissingContractError();
 
   const constructorParamLength = ast.contract.parameters.length;

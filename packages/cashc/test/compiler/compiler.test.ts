@@ -105,6 +105,7 @@ describe('Compiler', () => {
       expect(artifact.compiler.options).toEqual({
         enforceFunctionParameterTypes: true,
         enforceLocktimeGuard: false,
+        optimizeFor: 'opcost',
       });
     });
   });
