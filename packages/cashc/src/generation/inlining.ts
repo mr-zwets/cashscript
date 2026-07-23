@@ -1,6 +1,7 @@
 import {
   encodeInt,
   Op,
+  OptimizationTarget,
   OptimiseBytecodeResult,
   Script,
   scriptToBytecode,
@@ -45,11 +46,36 @@ export const shouldInline = (
   }
 
   const callCount = reachableCalls.filter((call) => call.identifier.symbol === symbol).length;
-  return isWorthInlining(nextFunctionId, optimisedResult.script, callCount);
+  return isWorthInlining(nextFunctionId, optimisedResult.script, callCount, compilerOptions.optimizeFor);
 };
 
-function isWorthInlining(candidateFunctionId: number, bodyScript: Script, callCount: number): boolean {
+// Op-cost accounting (CHIP-2021-05 VM limits): every evaluated instruction costs a base 100 and
+// stack pushes add 1 per pushed byte, so sharing a body of B bytes (1-byte funcid) pays
+// <body push> <id push> OP_DEFINE = 301 + 2B once per spend (OP_DEFINE re-prices the body's
+// stack-pushed bytes) plus <id push> OP_INVOKE = 201 per call, while an inlined body executes at
+// identical cost to an invoked one. For EXECUTED call sites inlining therefore always wins op-cost.
+// That is not a universal win: a SKIPPED call site (untaken branch — e.g. a helper called once per
+// entry function of a multi-function contract) steps the whole inlined body at 100/opcode where an
+// invoke site steps 2 ops (a 6-element body: 600 vs 200; a helper shared across 4 entry functions
+// measured ~686 op-cost worse AND +8 bytes when force-inlined). Forcing tiny bodies inline is thus
+// a bet on execution density — that call sites usually execute — with the downside bounded small:
+// each skipped site risks ~100 x (elements - 2) op-cost, while each executed site saves the
+// 201/call invoke overhead plus the one-time 301 + 2B define. On bytes: a body of at most 6 bytes
+// is one the exact byte model below would also inline at two uses, so forcing it inline at every
+// use count caps the size regression at ~4 bytes per extra call site. Loop-resident bodies are
+// still excluded above: stepping a skipped inlined body costs 100/opcode per ITERATION, which
+// quickly dwarfs the 201/call invoke saving.
+const OPCOST_INLINE_MAX_BODY_BYTES = 6;
+
+function isWorthInlining(
+  candidateFunctionId: number,
+  bodyScript: Script,
+  callCount: number,
+  optimizeFor?: OptimizationTarget,
+): boolean {
   const bodyBytecode = scriptToBytecode(bodyScript);
+  if (optimizeFor !== 'size' && bodyBytecode.length <= OPCOST_INLINE_MAX_BODY_BYTES) return true;
+
   const functionId = encodeInt(BigInt(candidateFunctionId));
 
   const defineBytes = scriptToBytecode([bodyBytecode, functionId, Op.OP_DEFINE]).length;
