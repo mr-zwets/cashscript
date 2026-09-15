@@ -89,7 +89,10 @@ function isWorthInlining(
   const bytesWhenDefined = defineBytes + callCount * invokeBytes;
   const bytesWhenInlined = callCount * bodyBytecode.length;
 
-  return bytesWhenInlined <= bytesWhenDefined;
+  // A byte tie is free to inline under 'opcost' (it removes the invoke overhead), but under 'size'
+  // the shared body is kept: inlining at parity gains nothing directly, and keeping the call
+  // sites small measurably helps the downstream stack rescheduling on large contracts.
+  return optimizeFor === 'size' ? bytesWhenInlined < bytesWhenDefined : bytesWhenInlined <= bytesWhenDefined;
 }
 
 // A multi-function contract compiles into one script with a selector branch per entry function,
