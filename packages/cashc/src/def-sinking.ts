@@ -65,9 +65,10 @@ function asSinkableDefinition(
 
   if (statement instanceof TupleAssignmentNode) {
     if (statement.targets.some((target) => target.isReassignment)) return undefined;
-    if (statement.targets.some((target) => reassigned.has(target.name))) return undefined;
+    if (statement.targets.some((target) => target.modifiers.includes(Modifier.UNUSED))) return undefined;
+    if (statement.targets.some((target) => reassigned.has(target.identifier.name))) return undefined;
     return {
-      names: new Set(statement.targets.map((target) => target.name)),
+      names: new Set(statement.targets.map((target) => target.identifier.name)),
       freeVariables: collectReferences(statement.tuple).references,
     };
   }
@@ -198,10 +199,10 @@ class ReferenceCollector extends AstTraversal {
   visitTupleAssignment(node: TupleAssignmentNode): Node {
     node.targets.forEach((target) => {
       if (target.isReassignment) {
-        this.assigns.add(target.name);
-        this.references.add(target.name);
+        this.assigns.add(target.identifier.name);
+        this.references.add(target.identifier.name);
       } else {
-        this.defines.add(target.name);
+        this.defines.add(target.identifier.name);
       }
     });
     return super.visitTupleAssignment(node);
