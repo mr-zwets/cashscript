@@ -214,7 +214,7 @@ class LiteralCounter extends AstTraversal {
   }
 
   visitTupleAssignment(node: TupleAssignmentNode): Node {
-    node.targets.forEach((target) => this.usedNames.add(target.name));
+    node.targets.forEach((target) => this.usedNames.add(target.identifier.name));
     return super.visitTupleAssignment(node);
   }
 }
