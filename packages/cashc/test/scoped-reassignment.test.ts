@@ -255,5 +255,8 @@ describe('scoped reassignment', () => {
 
     expect(relaidOut.indexOf('OP_BEGIN')).toBeGreaterThan(renamed.indexOf('OP_BEGIN'));
     expect(loopBody(relaidOut).length).toBeLessThan(loopBody(renamed).length);
+
+    // The body's temporary b is consumed by its final read, so nothing is left to drop per iteration
+    expect(loopBody(relaidOut)).not.toContain('OP_DROP');
   });
 });

@@ -135,6 +135,9 @@ export default class GenerateTargetTraversal extends AstTraversal {
   private scopedReassignment: ScopedReassignment = 'replace';
   private consumedReads: Set<IdentifierNode> = new Set();
   private slotCounter = 0;
+
+  // The scope depth each local variable was declared at (see isBlockLocalFinalRead)
+  private declarationScopeDepths: Map<string, number> = new Map();
   private callArgNameCounts: Map<string, number> | null = null;
 
   constructor(private compilerOptions: InternalCompilerOptions) {
@@ -549,6 +552,7 @@ export default class GenerateTargetTraversal extends AstTraversal {
 
     this.popFromStack();
     this.pushToStack(node.name);
+    this.declarationScopeDepths.set(node.name, this.scopeDepth);
     return node;
   }
 
@@ -569,6 +573,9 @@ export default class GenerateTargetTraversal extends AstTraversal {
         .filter((target) => target.isReassignment)
         .forEach((target) => this.renameReassignedVariable(target.identifier.name));
       node.targets.forEach((target) => this.pushToStack(target.identifier.name));
+      node.targets
+        .filter((target) => !target.isReassignment)
+        .forEach((target) => this.declarationScopeDepths.set(target.identifier.name, this.scopeDepth));
       this.dropUnusedTupleTargets(node);
       return node;
     }
@@ -1371,13 +1378,22 @@ export default class GenerateTargetTraversal extends AstTraversal {
       return this.userCallArgDepth === 0 || this.callArgNameCounts?.get(node.name) === 1;
     }
 
-    if (this.currentFunction.opRolls.get(node.name) !== node || this.scopeDepth !== 0) return false;
+    if (this.currentFunction.opRolls.get(node.name) !== node) return false;
+    if (this.scopeDepth !== 0 && !this.isBlockLocalFinalRead(node)) return false;
 
     // Inside a user function call's argument list, only variables that appear exactly once across
     // the whole argument tree may ROLL (see stageUserFunctionArguments)
     if (this.userCallArgDepth > 0) return this.callArgNameCounts?.get(node.name) === 1;
 
     return true;
+  }
+
+  // Inside a branch or loop, final reads are picked by default, so that every execution path leaves the
+  // same stack. When renaming, a variable's final read can roll it if the read is in the block the variable
+  // was declared in: that block's own reconcileStack would drop it anyway, and since the read is not in a
+  // nested loop or branch, it happens exactly once per execution of the block.
+  private isBlockLocalFinalRead(node: IdentifierNode): boolean {
+    return this.scopedReassignment === 'rename' && this.declarationScopeDepths.get(node.name) === this.scopeDepth;
   }
 
   visitBoolLiteral(node: BoolLiteralNode): Node {

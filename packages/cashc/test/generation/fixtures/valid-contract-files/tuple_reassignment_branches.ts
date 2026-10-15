@@ -22,10 +22,10 @@ export const fixtures: Fixture[] = [
         + 'OP_2 OP_PICK OP_10 OP_GREATERTHAN OP_IF '
         // int d, total = branchPair(a) — total's new value stays on top, above d
         + 'OP_2 OP_PICK OP_0 OP_INVOKE '
-        // require(d != 0)
-        + 'OP_OVER OP_0 OP_NUMNOTEQUAL OP_VERIFY '
-        // scope cleanup (drop d and the old total)
-        + 'OP_NIP OP_NIP OP_ENDIF '
+        // require(d != 0) (the final read of d consumes it)
+        + 'OP_SWAP OP_0 OP_NUMNOTEQUAL OP_VERIFY '
+        // scope cleanup (drop the old total)
+        + 'OP_NIP OP_ENDIF '
         // require(total >= 0) + cleanup
         + 'OP_0 OP_GREATERTHANOREQUAL OP_NIP OP_NIP '
         // function reassignmentFirst
@@ -36,18 +36,18 @@ export const fixtures: Fixture[] = [
         + 'OP_OVER OP_10 OP_GREATERTHAN OP_IF '
         // (total, int extra) = branchPair(a + 1) — no parking: both values stay on top
         + 'OP_OVER OP_1ADD OP_0 OP_INVOKE '
-        // require(extra != 0)
-        + 'OP_DUP OP_0 OP_NUMNOTEQUAL OP_VERIFY '
-        // scope cleanup (drop extra and the old total)
-        + 'OP_DROP OP_NIP OP_ENDIF '
+        // require(extra != 0) (consumes extra)
+        + 'OP_0 OP_NUMNOTEQUAL OP_VERIFY '
+        // scope cleanup (drop the old total)
+        + 'OP_NIP OP_ENDIF '
         // require(total >= 0) + cleanup
         + 'OP_0 OP_GREATERTHANOREQUAL OP_NIP OP_ENDIF',
       debug: {
-        bytecode: '127653957857979378529693768b7c52957b94008976009c630052795aa0635279008a78009e6977776800a2777767519d00785aa063788b008a76009e6975776800a27768',
-        sourceMap: '7::10:1;;::::1;14:4:21:5:0;;;;15:20:15:21;16:12:16:13;;:16::18;:12:::1;:20:19:9:0;17:38:17:39;;:27::40:1;;18:20:18:21:0;:25::26;:20:::1;:12::28;16:20:19:9;;;20:25:20:26:0;:8::28:1;14:37:21:5;;:4;25::32::0;;26:20:26:21;27:12:27:13;:16::18;:12:::1;:20:30:9:0;28:44:28:45;:::49:1;:33::50;;29:20:29:25:0;:29::30;:20:::1;:12::32;27:20:30:9;;;31:25:31:26:0;:8::28:1;25:38:32:5;12:0:33:1',
+        bytecode: '127653957857979378529693768b7c52957b94008976009c630052795aa0635279008a7c009e69776800a2777767519d00785aa063788b008a009e69776800a27768',
+        sourceMap: '7::10:1;;::::1;14:4:21:5:0;;;;15:20:15:21;16:12:16:13;;:16::18;:12:::1;:20:19:9:0;17:38:17:39;;:27::40:1;;18:20:18:21:0;:25::26;:20:::1;:12::28;16:20:19:9;;20:25:20:26:0;:8::28:1;14:37:21:5;;:4;25::32::0;;26:20:26:21;27:12:27:13;:16::18;:12:::1;:20:30:9:0;28:44:28:45;:::49:1;:33::50;;29:29:29:30:0;:20:::1;:12::32;27:20:30:9;;31:25:31:26:0;:8::28:1;25:38:32:5;12:0:33:1',
         logs: [],
-        requires: [{ ip: 20, line: 18 }, { ip: 26, line: 20 }, { ip: 43, line: 29 }, { ip: 49, line: 31 }],
-        sourceTags: '21:22:sc;26:27:sc;44:45:sc;49:49:sc',
+        requires: [{ ip: 20, line: 18 }, { ip: 25, line: 20 }, { ip: 41, line: 29 }, { ip: 46, line: 31 }],
+        sourceTags: '21:21:sc;25:26:sc;42:42:sc;46:46:sc',
         functions: [
           {
             id: 0,
@@ -60,7 +60,7 @@ export const fixtures: Fixture[] = [
           },
         ],
       },
-      fingerprint: 'd87e3e91689024fb3324b96e2d3926096f9d71a92d5c13e03bde06289819923a',
+      fingerprint: 'a19ec79f45d2b968576f445aed1ecd3715ff169776e66cae241d36c29312687a',
     },
   },
   // The same contract with reassignments in branches and loops forced to the 'replace' strategy
