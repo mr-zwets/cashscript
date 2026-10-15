@@ -1,6 +1,6 @@
-// Scoped tuple reassignment inside if-branches: the stack layout must be preserved, so
-// reassignment values are folded into the existing variable slots (with altstack parking when a
-// declaration value sits above a reassignment value).
+// Scoped tuple reassignment inside if-branches: the stack layout must be preserved, so reassigned
+// values are either folded into the existing variable slots (with altstack parking when a declaration
+// value sits above a reassignment value), or renamed on top and the old values dropped at the end.
 
 // Called from both contract functions and large enough that it is NOT inlined, so destructuring
 // also covers results produced by an OP_INVOKE call (single-call functions are always inlined).
@@ -20,8 +20,8 @@ contract TupleReassignmentBranches() {
         require(total >= 0);
     }
 
-    // reassignment before declaration inside a branch: the trailing declaration value is parked
-    // on the altstack while the reassignment value below it folds into its slot
+    // reassignment before declaration inside a branch: when folding, the trailing declaration value
+    // is parked on the altstack while the reassignment value below it folds into its slot
     function reassignmentFirst(int a) {
         int total = 0;
         if (a > 10) {

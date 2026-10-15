@@ -79,7 +79,23 @@ import { getCompileTimeBytes, isNumericType } from '../utils.js';
 import {
   collectEntryReachableCalls, collectFunctionCalls, collectLoopResidentFunctions, isRecursive, shouldInline,
 } from './inlining.js';
-import type { InternalCompilerOptions } from '../compiler.js';
+import type { InternalCompilerOptions, ScopedReassignment } from '../compiler.js';
+
+// Scopes nested deeper than this inherit their parent's reassignment strategy instead of trying both,
+// which bounds the extra code generation passes (see chooseScopedReassignment)
+const MAX_REASSIGNMENT_TRIAL_DEPTH = 2;
+
+interface TraversalState {
+  output: Script;
+  locationData: FullLocationData;
+  stack: string[];
+  consoleLogs: LogEntry[];
+  requires: RequireStatement[];
+  sourceTags: SourceTagEntry[];
+  finalStackUsage: Record<string, StackItem>;
+  inlineRanges: InlineRange[];
+  consumedReads: Set<IdentifierNode>;
+}
 
 interface InlineRange {
   startIp: number;
@@ -111,6 +127,14 @@ export default class GenerateTargetTraversal extends AstTraversal {
 
   // Tracks right-to-left argument staging for user function calls (see stageUserFunctionArguments)
   private userCallArgDepth = 0;
+
+  // How reassignments inside a branch or loop are compiled. 'replace' rolls the new value into the
+  // variable's fixed slot (emitReplace), which costs O(depth) per value. 'rename' leaves the new value
+  // on top and renames it, consuming the old value when the right-hand side reads it exactly once
+  // (consumedReads); the scope then restores its entry layout once at its end (reconcileStack).
+  private scopedReassignment: ScopedReassignment = 'replace';
+  private consumedReads: Set<IdentifierNode> = new Set();
+  private slotCounter = 0;
   private callArgNameCounts: Map<string, number> | null = null;
 
   constructor(private compilerOptions: InternalCompilerOptions) {
@@ -529,11 +553,17 @@ export default class GenerateTargetTraversal extends AstTraversal {
   }
 
   visitTupleAssignment(node: TupleAssignmentNode): Node {
+    const renameInScope = this.scopeDepth > 0 && this.scopedReassignment === 'rename';
+    if (renameInScope) {
+      const reassigned = node.targets.filter((target) => target.isReassignment && !target.identifier.symbol!.isUnused());
+      this.markConsumedReads(reassigned.map((target) => target.identifier), node.tuple);
+    }
+
     node.tuple = this.visit(node.tuple);
 
-    // Outside of a loop/branch, a reassignment is just a rename (the old value stays on the stack)
+    // Outside of a loop/branch (or when renaming inside one), a reassignment is just a rename
     const scopedReassign = this.scopeDepth > 0 && node.targets.some((target) => target.isReassignment);
-    if (!scopedReassign) {
+    if (!scopedReassign || renameInScope) {
       this.popFromStack(node.targets.length);
       node.targets
         .filter((target) => target.isReassignment)
@@ -584,6 +614,11 @@ export default class GenerateTargetTraversal extends AstTraversal {
   }
 
   visitAssign(node: AssignNode): Node {
+    const renameInScope = this.scopeDepth > 0 && this.scopedReassignment === 'rename';
+    if (renameInScope && !node.identifier.symbol!.isUnused()) {
+      this.markConsumedReads([node.identifier], node.expression);
+    }
+
     node.expression = this.visit(node.expression);
 
     // An unused variable never gets added to the stack, so the assigned value is dropped as well
@@ -593,7 +628,7 @@ export default class GenerateTargetTraversal extends AstTraversal {
       return node;
     }
 
-    if (this.scopeDepth > 0) {
+    if (this.scopeDepth > 0 && !renameInScope) {
       this.emitReplace(this.getStackIndex(node.identifier.name), node);
       this.popFromStack();
     } else {
@@ -606,9 +641,137 @@ export default class GenerateTargetTraversal extends AstTraversal {
 
   // Outside of a loop/branch, a reassignment leaves the old value on the stack (it gets dropped with the rest of the
   // stack at the end of the function). We make that old slot anonymous, so it can never be read as the new value.
+  // Inside a scope (renaming), the slot gets a unique name so that the scope's reconcileStack can drop it.
   private renameReassignedVariable(name: string): void {
     const stackIndex = this.getStackIndex(name, true);
-    if (stackIndex !== -1) this.stack[stackIndex] = '(value)';
+    if (stackIndex === -1) return;
+    this.stack[stackIndex] = this.scopeDepth > 0 ? this.uniqueSlotName('(dead)') : '(value)';
+  }
+
+  // A reassignment target that its right-hand side reads exactly once is consumed (rolled instead of
+  // picked) by that read, since the old value is dead right after it
+  private markConsumedReads(targets: IdentifierNode[], expression: Node): void {
+    const collector = new IdentifierReadCollector();
+    collector.visit(expression);
+    targets.forEach((target) => {
+      const reads = collector.reads.filter((read) => read.name === target.name);
+      if (reads.length === 1) this.consumedReads.add(reads[0]);
+    });
+  }
+
+  private uniqueSlotName(prefix: string): string {
+    this.slotCounter += 1;
+    return `${prefix}#${this.slotCounter}`;
+  }
+
+  // The stack layout at a scope's entry. Anonymous slots get unique names, so they can be tracked by name.
+  private snapshotStack(): string[] {
+    this.stack = this.stack.map((name) => (name === '(value)' ? this.uniqueSlotName('(value)') : name));
+    return [...this.stack];
+  }
+
+  // Restore a scope's entry layout: drop what the scope added (scoped declarations, the old slots of renamed
+  // reassignments), then, if reorder is set, roll the variables that moved back into their entry order.
+  private reconcileStack(target: string[], node: Node, reorder: boolean = true): void {
+    const locationData = { location: node.location, positionHint: PositionHint.END };
+    const tagStartIndex = this.output.length;
+
+    this.stack.filter((name) => !target.includes(name)).forEach((name) => {
+      const stackIndex = this.getStackIndex(name);
+      this.emit(encodeInt(BigInt(stackIndex)), locationData);
+      this.emit(Op.OP_ROLL, locationData);
+      this.emit(Op.OP_DROP, locationData);
+      this.removeFromStack(stackIndex);
+    });
+    this.tagScopeCleanup(tagStartIndex);
+
+    if (!reorder) return;
+
+    // Items at the bottom that are already in place stay; the others are rolled up, deepest first
+    let inPlace = 0;
+    while (inPlace < target.length && this.stack.at(-1 - inPlace) === target.at(-1 - inPlace)) inPlace += 1;
+
+    target.slice(0, target.length - inPlace).reverse().forEach((name) => {
+      const stackIndex = this.getStackIndex(name);
+      if (stackIndex === 0) return;
+      this.emit(encodeInt(BigInt(stackIndex)), locationData);
+      this.emit(Op.OP_ROLL, locationData);
+      this.removeFromStack(stackIndex);
+      this.pushToStack(name);
+    });
+  }
+
+  // Branches and loops are compiled with both reassignment strategies (unless forced or nested too deep),
+  // keeping the cheaper one: renaming wins big for deep loop-carried variables, while replacing stays
+  // cheaper for shallow ones, where the peephole optimiser shortens emitReplace's shuffles.
+  private chooseScopedReassignment(node: Node, emitScope: () => void): void {
+    const outerStrategy = this.scopedReassignment;
+    const forcedStrategy = this.compilerOptions.scopedReassignment;
+
+    if (forcedStrategy || this.scopeDepth >= MAX_REASSIGNMENT_TRIAL_DEPTH || !containsReassignment(node)) {
+      this.scopedReassignment = forcedStrategy ?? outerStrategy;
+      emitScope();
+      this.scopedReassignment = outerStrategy;
+      return;
+    }
+
+    const start = this.saveState();
+    const candidates = (['replace', 'rename'] as const).map((strategy) => {
+      this.restoreState(start);
+      this.scopedReassignment = strategy;
+      emitScope();
+      return { state: this.saveState(), cost: this.costSince(start.output.length) };
+    });
+
+    // Ties keep 'replace'
+    const best = candidates.reduce((a, b) => (compareCosts(b.cost, a.cost) < 0 ? b : a));
+    this.restoreState(best.state);
+    this.scopedReassignment = outerStrategy;
+  }
+
+  private saveState(): TraversalState {
+    return {
+      output: [...this.output],
+      locationData: [...this.locationData],
+      stack: [...this.stack],
+      consoleLogs: [...this.consoleLogs],
+      requires: [...this.requires],
+      sourceTags: [...this.sourceTags],
+      finalStackUsage: { ...this.finalStackUsage },
+      inlineRanges: [...this.inlineRanges],
+      consumedReads: new Set(this.consumedReads),
+    };
+  }
+
+  private restoreState(state: TraversalState): void {
+    this.output = [...state.output];
+    this.locationData = [...state.locationData];
+    this.stack = [...state.stack];
+    this.consoleLogs = [...state.consoleLogs];
+    this.requires = [...state.requires];
+    this.sourceTags = [...state.sourceTags];
+    this.finalStackUsage = { ...state.finalStackUsage };
+    this.inlineRanges = [...state.inlineRanges];
+    this.consumedReads = new Set(state.consumedReads);
+  }
+
+  // The cost of the code emitted since startIndex, after peephole optimisation, ordered by the optimisation
+  // objective: [bytes, weighted instructions] for 'size', the reverse for 'opcost'. Instructions inside
+  // loops are weighted by 16 per nesting level, as a static stand-in for their iteration count.
+  private costSince(startIndex: number): [number, number] {
+    const fragment = asmToScript(scriptToAsm(this.output.slice(startIndex)));
+    const { script } = optimiseBytecode(fragment, this.locationData.slice(startIndex), [], [], [], [], 0);
+
+    let loopDepth = 0;
+    let weightedInstructions = 0;
+    script.forEach((op) => {
+      if (op === Op.OP_UNTIL) loopDepth = Math.max(0, loopDepth - 1);
+      weightedInstructions += 16 ** loopDepth;
+      if (op === Op.OP_BEGIN) loopDepth += 1;
+    });
+
+    const bytes = scriptToBytecode(script).length;
+    return this.compilerOptions.optimizeFor === 'size' ? [bytes, weightedInstructions] : [weightedInstructions, bytes];
   }
 
   // This algorithm can be optimised for hardcoded depths
@@ -705,21 +868,26 @@ export default class GenerateTargetTraversal extends AstTraversal {
   }
 
   visitBranch(node: BranchNode): Node {
+    this.chooseScopedReassignment(node, () => this.emitBranch(node));
+    return node;
+  }
+
+  private emitBranch(node: BranchNode): void {
     node.condition = this.visit(node.condition);
     this.popFromStack();
 
     this.scopeDepth += 1;
     this.emit(Op.OP_IF, { location: node.ifBlock.location, positionHint: PositionHint.START });
 
-    let stackDepth = this.stack.length;
+    // Both branches end in the layout the branch was entered with
+    const entryStack = this.snapshotStack();
     node.ifBlock = this.visit(node.ifBlock);
-    this.removeScopedVariables(stackDepth, node.ifBlock);
+    this.reconcileStack(entryStack, node.ifBlock);
 
     if (node.elseBlock) {
       this.emit(Op.OP_ELSE, { location: node.elseBlock.location, positionHint: PositionHint.START });
-      stackDepth = this.stack.length;
       node.elseBlock = this.visit(node.elseBlock);
-      this.removeScopedVariables(stackDepth, node.elseBlock);
+      this.reconcileStack(entryStack, node.elseBlock);
     }
 
     const endLocationData = {
@@ -729,17 +897,21 @@ export default class GenerateTargetTraversal extends AstTraversal {
 
     this.emit(Op.OP_ENDIF, endLocationData);
     this.scopeDepth -= 1;
-
-    return node;
   }
 
   visitDoWhile(node: DoWhileNode): Node {
+    this.chooseScopedReassignment(node, () => this.emitDoWhile(node));
+    return node;
+  }
+
+  private emitDoWhile(node: DoWhileNode): void {
     this.scopeDepth += 1;
     this.emit(Op.OP_BEGIN, { location: node.location, positionHint: PositionHint.START });
 
-    const stackDepth = this.stack.length;
+    // Every iteration ends in the layout the loop was entered with
+    const entryStack = this.snapshotStack();
     node.block = this.visit(node.block);
-    this.removeScopedVariables(stackDepth, node.block);
+    this.reconcileStack(entryStack, node.block);
 
     node.condition = this.visit(node.condition);
     this.emit(Op.OP_NOT, { location: node.location, positionHint: PositionHint.END });
@@ -748,11 +920,14 @@ export default class GenerateTargetTraversal extends AstTraversal {
     this.popFromStack();
 
     this.scopeDepth -= 1;
-
-    return node;
   }
 
   visitWhile(node: WhileNode): Node {
+    this.chooseScopedReassignment(node, () => this.emitWhile(node));
+    return node;
+  }
+
+  private emitWhile(node: WhileNode): void {
     this.scopeDepth += 1;
     this.emit(Op.OP_BEGIN, { location: node.location, positionHint: PositionHint.START });
 
@@ -765,20 +940,21 @@ export default class GenerateTargetTraversal extends AstTraversal {
     this.popFromStack();
     this.emit(Op.OP_IF, { location: node.block.location, positionHint: PositionHint.START });
 
-    const bodyStackDepth = this.stack.length;
+    const bodyEntryStack = this.snapshotStack();
     node.block = this.visit(node.block) as BlockNode;
-    this.removeScopedVariables(bodyStackDepth, node.block);
+    this.reconcileStack(bodyEntryStack, node.block);
 
     this.emitLoopCondition(node);
 
     this.scopeDepth -= 1;
-
-    return node;
   }
 
   visitFor(node: ForNode): Node {
-    const forScopeStackDepth = this.stack.length;
+    this.chooseScopedReassignment(node, () => this.emitFor(node));
+    return node;
+  }
 
+  private emitFor(node: ForNode): void {
     // If the init is a re-assignment, we need to increment the scope depth so it gets treated as a scoped reassignment
     // (and therefore the stack value gets properly replaced)
     const isReassignment = node.init instanceof AssignNode;
@@ -786,6 +962,11 @@ export default class GenerateTargetTraversal extends AstTraversal {
     node.init = this.visit(node.init) as VariableDefinitionNode | AssignNode;
     if (isReassignment) this.scopeDepth -= 1;
 
+    // What remains after the loop: the stack after the init (which may have consumed variables), without a
+    // declared loop variable
+    const forScopeStack = this.snapshotStack()
+      .filter((name) => !(node.init instanceof VariableDefinitionNode && name === node.init.name));
+
     this.scopeDepth += 1;
     this.emit(Op.OP_BEGIN, { location: node.location, positionHint: PositionHint.START });
 
@@ -798,7 +979,7 @@ export default class GenerateTargetTraversal extends AstTraversal {
     this.popFromStack();
     this.emit(Op.OP_IF, { location: node.block.location, positionHint: PositionHint.START });
 
-    const bodyStackDepth = this.stack.length;
+    const bodyEntryStack = this.snapshotStack();
     node.block = this.visit(node.block) as BlockNode;
 
     const updateStartIndex = this.output.length;
@@ -806,14 +987,14 @@ export default class GenerateTargetTraversal extends AstTraversal {
     const updateEndIndex = this.output.length - 1;
     this.sourceTags.push({ startIndex: updateStartIndex, endIndex: updateEndIndex, kind: SourceTagKind.FOR_UPDATE });
 
-    this.removeScopedVariables(bodyStackDepth, node.block);
+    // Every iteration (body and update) ends in the layout the loop was entered with
+    this.reconcileStack(bodyEntryStack, node.block);
 
     this.emitLoopCondition(node);
 
+    // After the loop only the loop variable has to go; an enclosing scope restores the order if it needs to
     this.scopeDepth -= 1;
-    this.removeScopedVariables(forScopeStackDepth, node);
-
-    return node;
+    this.reconcileStack(forScopeStack, node, false);
   }
 
   // Emits the loop-back epilogue shared by while- and for-loops: OP_ENDIF closes the body branch,
@@ -833,11 +1014,6 @@ export default class GenerateTargetTraversal extends AstTraversal {
       endIndex: this.output.length - 1,
       kind: SourceTagKind.LOOP_CONDITION,
     });
-  }
-
-  // Drop the values that a scope (a branch or loop body) added on top of the pre-scope stack.
-  removeScopedVariables(depthBeforeScope: number, node: Node): void {
-    this.dropFromStack(node, 0, this.stack.length - depthBeforeScope);
   }
 
   private tagScopeCleanup(tagStartIndex: number): void {
@@ -1116,12 +1292,14 @@ export default class GenerateTargetTraversal extends AstTraversal {
     // If the final use is inside an if-statement, we still OP_PICK it
     // We do this so that there's no difference in stack depths between execution paths
     if (this.isOpRoll(node)) {
-      const symbol = node.symbol!;
-      this.finalStackUsage[node.name] = {
-        type: symbol.type.toString(),
-        stackIndex,
-        ip: this.getMostRecentInstructionPointer(),
-      };
+      // A consumed read is not a final use: the variable is renamed onto the stack right after it
+      if (!this.consumedReads.has(node)) {
+        this.finalStackUsage[node.name] = {
+          type: node.symbol!.type.toString(),
+          stackIndex,
+          ip: this.getMostRecentInstructionPointer(),
+        };
+      }
 
       this.emit(Op.OP_ROLL, { location: node.location, positionHint: PositionHint.START });
       this.removeFromStack(stackIndex);
@@ -1134,6 +1312,10 @@ export default class GenerateTargetTraversal extends AstTraversal {
   }
 
   isOpRoll(node: IdentifierNode): boolean {
+    if (this.consumedReads.has(node)) {
+      return this.userCallArgDepth === 0 || this.callArgNameCounts?.get(node.name) === 1;
+    }
+
     if (this.currentFunction.opRolls.get(node.name) !== node || this.scopeDepth !== 0) return false;
 
     // Inside a user function call's argument list, only variables that appear exactly once across
@@ -1166,6 +1348,52 @@ export default class GenerateTargetTraversal extends AstTraversal {
     this.pushToStack('(value)');
     return node;
   }
+}
+
+// Collects the variable reads of an expression (callee identifiers are not stack-variable reads)
+class IdentifierReadCollector extends AstTraversal {
+  reads: IdentifierNode[] = [];
+
+  visitIdentifier(node: IdentifierNode): Node {
+    this.reads.push(node);
+    return node;
+  }
+
+  visitFunctionCall(node: FunctionCallNode): Node {
+    node.parameters = this.visitList(node.parameters);
+    return node;
+  }
+
+  visitInstantiation(node: InstantiationNode): Node {
+    node.parameters = this.visitList(node.parameters);
+    return node;
+  }
+}
+
+class ReassignmentFinder extends AstTraversal {
+  found = false;
+
+  visitAssign(node: AssignNode): Node {
+    this.found = true;
+    return node;
+  }
+
+  visitTupleAssignment(node: TupleAssignmentNode): Node {
+    if (node.targets.some((target) => target.isReassignment)) this.found = true;
+    return node;
+  }
+}
+
+function containsReassignment(node: Node): boolean {
+  const finder = new ReassignmentFinder();
+  finder.visit(node);
+  return finder.found;
+}
+
+// Lexicographic comparison of two costs
+function compareCosts(a: number[], b: number[]): number {
+  const index = a.findIndex((value, i) => value !== b[i]);
+  return index === -1 ? 0 : a[index] - b[index];
 }
 
 // Counts identifier reads across a user function call's whole argument tree. Callee identifiers

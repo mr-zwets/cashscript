@@ -28,15 +28,15 @@ contract TupleReassignment() {
             (a, b) = swap(a, b);
         }
 
-        // mixed declaration + reassignment IN A LOOP, reassignments first: the cheapest ordering (fresh
-        // declarations are parked on the altstack, reassignments roll values down into their slot)
+        // mixed declaration + reassignment IN A LOOP, reassignments first: the cheapest ordering when
+        // values are replaced in their slots (fresh declarations are parked on the altstack meanwhile)
         for (int j = 0; j < 4; j = j + 1) {
             (a, b, int lo) = step(a, b);
             require(lo >= 0);
         }
 
-        // interleaved order works too: the declaration value is parked on the altstack while the
-        // reassignment value below it folds into its slot
+        // interleaved order works too: when replacing, the declaration value is parked on the altstack
+        // while the reassignment value below it folds into its slot
         for (int k = 0; k < 2; k = k + 1) {
             (a, int hi, b) = step(a, b);
             require(hi >= 0);

@@ -42,5 +42,6 @@ describe('Code generation & target code optimisation', () => {
 function artifactCompilerOptions(compilerOptions: InternalCompilerOptions = {}): CompilerOptions {
   const mergedOptions: InternalCompilerOptions = { ...DEFAULT_COMPILER_OPTIONS, ...compilerOptions };
   delete mergedOptions.disableInlining;
+  delete mergedOptions.scopedReassignment;
   return mergedOptions;
 }

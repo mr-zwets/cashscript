@@ -3,8 +3,54 @@ import { Fixture } from '../../fixture-utils.js';
 export const fixtures: Fixture[] = [
   {
     // Tuple destructuring into existing variables: top-level renames (with the small helpers
+    // inlined at the call sites), and pure, mixed and interleaved reassignment in loops, where the
+    // reassigned values are renamed on top and each iteration restores the loop's layout once.
+    artifact: {
+      contractName: 'TupleReassignment',
+      constructorInputs: [],
+      abi: [
+        {
+          name: 'spend',
+          inputs: [{ name: 'seed', type: 'int' }],
+        },
+      ],
+      bytecode: '7d5279537a958b OP_0 OP_DEFINE OP_DUP OP_1ADD OP_2DUP OP_SWAP OP_2DUP OP_SWAP OP_0 OP_BEGIN OP_DUP OP_4 OP_LESSTHAN OP_DUP OP_TOALTSTACK OP_IF OP_3 OP_ROLL OP_ROT OP_ROT OP_1ADD OP_SWAP OP_2SWAP OP_3 OP_ROLL OP_ENDIF OP_FROMALTSTACK OP_NOT OP_UNTIL OP_DROP OP_0 OP_BEGIN OP_DUP OP_4 OP_LESSTHAN OP_DUP OP_TOALTSTACK OP_IF OP_3 OP_ROLL OP_ROT OP_0 OP_INVOKE OP_DUP OP_0 OP_GREATERTHANOREQUAL OP_VERIFY OP_3 OP_ROLL OP_1ADD OP_NIP OP_SWAP OP_2SWAP OP_3 OP_ROLL OP_ENDIF OP_FROMALTSTACK OP_NOT OP_UNTIL OP_DROP OP_0 OP_BEGIN OP_DUP OP_2 OP_LESSTHAN OP_DUP OP_TOALTSTACK OP_IF OP_3 OP_ROLL OP_ROT OP_0 OP_INVOKE OP_OVER OP_0 OP_GREATERTHANOREQUAL OP_VERIFY OP_3 OP_ROLL OP_1ADD OP_ROT OP_DROP OP_SWAP OP_2SWAP OP_3 OP_ROLL OP_ENDIF OP_FROMALTSTACK OP_NOT OP_UNTIL OP_DROP OP_2DUP OP_ROT OP_ROT OP_ADD OP_ROT OP_ADD OP_ADD OP_0 OP_GREATERTHANOREQUAL OP_VERIFY OP_2DROP OP_2DROP OP_1',
+      fingerprint: 'dfe8b89566218b8081900d7756aeb419318d63353208ce55ccb6973048950505',
+      debug: {
+        bytecode: '077d5279537a958b0089768b6e7c6e7c006576549f766b63537a7b7b8b7c72537a686c916675006576549f766b63537a7b008a7600a269537a8b777c72537a686c916675006576529f766b63537a7b008a7800a269537a8b7b757c72537a686c9166756e7b7b937b939300a2696d6d51',
+        sourceMap: '11::13:1;;::::1;17:16:18:20:0;18:::24:1;21:22:21:26:0;;24:26:24:30;;27:21:27:22;:8:29:9;:24:27:25;:28::29;:24:::1;;;:42:29:9:0;28:29:28:30;;:26::27;27:35:27:36;:::40:1;:42:29:9;;;;;;:8;;;33:21:33:22:0;:8:36:9;:24:33:25;:28::29;:24:::1;;;:42:36:9:0;34:37:34:38;;:34::35;:29::39:1;;35:20:35:22:0;:26::27;:20:::1;:12::29;33:35:33:36:0;;:::40:1;:42:36:9;;;;;;;:8;;;40:21:40:22:0;:8:43:9;:24:40:25;:28::29;:24:::1;;;:42:43:9:0;41:37:41:38;;:34::35;:29::39:1;;42:20:42:22:0;:26::27;:20:::1;:12::29;40:35:40:36:0;;:::40:1;:42:43:9;;;;;;;;:8;;;46:24:46:28:0;48:16:48:17;:20::21;:16:::1;:24::25:0;:16:::1;:::29;:33::34:0;:16:::1;:8::36;16:29:49:5;;',
+        logs: [],
+        requires: [{ ip: 47, line: 35 }, { ip: 77, line: 42 }, { ip: 101, line: 48 }],
+        sourceTags: '20:21:fu;26:29:lc;30:30:sc;48:50:fu;51:51:sc;56:59:lc;60:60:sc;78:80:fu;87:90:lc;91:91:sc',
+        functions: [
+          {
+            id: 0,
+            name: 'step',
+            inputs: [{ name: 'x', type: 'int' }, { name: 'y', type: 'int' }],
+            bytecode: '7d5279537a958b',
+            sourceMap: '12:11:12:15;:17::18;;:21::22;;:17:::1;:::26',
+            logs: [],
+            requires: [],
+          },
+          {
+            name: 'swap',
+            inputs: [{ name: 'x', type: 'int' }, { name: 'y', type: 'int' }],
+            bytecode: '',
+            sourceMap: '',
+            logs: [],
+            requires: [],
+          },
+        ],
+      },
+    },
+  },
+  // The same contract with reassignments in branches and loops forced to the 'replace' strategy
+  // which re-inserts every new value at its variable's slot (see emitReplace)
+  {
+    // Tuple destructuring into existing variables: top-level renames (with the small helpers
     // inlined at the call sites), pure and mixed reassignment in loops, and the interleaved
     // order that parks a declaration value on the altstack mid-fold.
+    compilerOptions: { scopedReassignment: 'replace' },
     artifact: {
       contractName: 'TupleReassignment',
       constructorInputs: [],

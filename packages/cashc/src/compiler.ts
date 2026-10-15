@@ -96,7 +96,12 @@ export interface InternalCompilerOptions extends CompilerOptions {
   // locals when that shrinks the bytecode (the compiler keeps the hoisted compile only when it
   // is strictly smaller). This flag is for tools that need the literal-shaped compile as input.
   disableConstantHoisting?: boolean;
+  // Force one code generation strategy for reassignments inside branches and loops instead of
+  // keeping the cheaper one per scope (see chooseScopedReassignment). For tests and tooling.
+  scopedReassignment?: ScopedReassignment;
 }
+
+export type ScopedReassignment = 'replace' | 'rename';
 
 // The AST rewrites applied before semantic analysis in a single compile candidate.
 interface RewriteFlags {
@@ -158,7 +163,7 @@ function compileImpl(
     // consumed in compileCode (which picks the smallest rewrite combination); destructured here
     // only to keep them out of the serialized artifact options
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    disableDefSinking, disableConstantHoisting,
+    disableDefSinking, disableConstantHoisting, scopedReassignment,
     ...artifactCompilerOptions
   } = compilerOptions;
   const mergedCompilerOptions = { ...DEFAULT_COMPILER_OPTIONS, ...artifactCompilerOptions };
@@ -205,7 +210,7 @@ function compileImpl(
   ast = ast.accept(new DeadCodeEliminationTraversal()) as Ast;
 
   // Code generation
-  const traversal = new GenerateTargetTraversal({ ...mergedCompilerOptions, disableInlining });
+  const traversal = new GenerateTargetTraversal({ ...mergedCompilerOptions, disableInlining, scopedReassignment });
   ast = ast.accept(traversal) as Ast;
 
   // Bytecode optimisation
