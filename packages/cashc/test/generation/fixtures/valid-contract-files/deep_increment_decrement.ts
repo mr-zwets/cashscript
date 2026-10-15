@@ -26,19 +26,18 @@ export const fixtures: Fixture[] = [
         // int c = 3;
         + 'OP_3 '
         // for (int i = 0; i < 3; i++) {
-        + 'OP_0 OP_BEGIN OP_DUP OP_3 OP_LESSTHAN OP_DUP OP_TOALTSTACK OP_IF '
+        // the loop head takes the order the body leaves remaining, steps and i in (all on top)
+        + 'OP_0 OP_2SWAP OP_3 OP_ROLL OP_2ROT OP_5 OP_ROLL OP_BEGIN OP_DUP OP_3 OP_LESSTHAN OP_DUP OP_TOALTSTACK OP_IF '
         // remaining = remaining - 1; (its only read consumes remaining, the new value stays on top)
-        + 'OP_5 OP_ROLL OP_1SUB '
+        + 'OP_ROT OP_1SUB '
         // steps = steps + 1;
-        + 'OP_5 OP_ROLL OP_1ADD '
-        // i++
         + 'OP_ROT OP_1ADD '
-        // Restore the loop's entry layout
-        + 'OP_ROT OP_ROT OP_2ROT OP_2ROT '
+        // i++ (which leaves the stack in the loop head's order again)
+        + 'OP_ROT OP_1ADD '
         // Loop condition
         + 'OP_ENDIF OP_FROMALTSTACK OP_NOT OP_UNTIL '
-        // Cleanup
-        + 'OP_DROP '
+        // Cleanup, and put the variables back in their original order
+        + 'OP_DROP OP_4 OP_ROLL OP_4 OP_ROLL OP_4 OP_ROLL '
         // require(a + b + c == 6);
         + 'OP_ROT OP_ROT OP_ADD OP_ADD OP_6 OP_NUMEQUALVERIFY '
         // require(remaining + steps == budget);
@@ -64,13 +63,13 @@ export const fixtures: Fixture[] = [
         // }
         + 'OP_ENDIF',
       debug: {
-        bytecode: '76009c637800515253006576539f766b63557a8c557a8b7b8b7b7b7171686c9166757b7b9393569d937b9c7767519d6e9f638c7c8c7b8c7c7b68939300a068',
-        sourceMap: '2:4:16:5;;;;3:24:3:30;4:20:4:21;5:16:5:17;6::6;7::7;9:21:9:22;:8:12:9;:24:9:25;:28::29;:24:::1;;;:36:12:9:0;10:24:10:33;;:::37:1;11:20:11:25:0;;:::29:1;9:31:9:32:0;:::34:1;:36:12:9;;;;;;:8;;;14:16:14:17:0;:20::21;:16:::1;:::25;:29::30:0;:8::32:1;15:16:15:33;:37::43:0;:8::45:1;2:30:16:5;:4;18::26::0;;19:12:19:17;::::1;:19:23:9:0;20:16:20:21:1;21::21:17:0;:::21:1;22::22:17:0;:::21:1;19:19:23:9;;;25:16:25:21;:::25;:28::29:0;:8::31:1;1:0:27:1',
+        bytecode: '76009c6378005152530072537a71557a6576539f766b637b8c7b8b7b8b686c916675547a547a547a7b7b9393569d937b9c7767519d6e9f638c7c8c7b8c7c7b68939300a068',
+        sourceMap: '2:4:16:5;;;;3:24:3:30;4:20:4:21;5:16:5:17;6::6;7::7;9:21:9:22;:8:12:9;;;;;;;:24:9:25;:28::29;:24:::1;;;:36:12:9:0;10:24:10:33;:::37:1;11:20:11:25:0;:::29:1;9:31:9:32:0;:::34:1;:36:12:9;;:8;;;;;;;;;14:16:14:17:0;:20::21;:16:::1;:::25;:29::30:0;:8::32:1;15:16:15:33;:37::43:0;:8::45:1;2:30:16:5;:4;18::26::0;;19:12:19:17;::::1;:19:23:9:0;20:16:20:21:1;21::21:17:0;:::21:1;22::22:17:0;:::21:1;19:19:23:9;;;25:16:25:21;:::25;:28::29:0;:8::31:1;1:0:27:1',
         logs: [],
-        requires: [{ ip: 39, line: 14 }, { ip: 43, line: 15 }, { ip: 62, line: 25 }],
-        sourceTags: '23:24:fu;29:32:lc;33:33:sc;43:43:sc',
+        requires: [{ ip: 45, line: 14 }, { ip: 49, line: 15 }, { ip: 68, line: 25 }],
+        sourceTags: '27:28:fu;29:32:lc;33:33:sc;49:49:sc',
       },
-      fingerprint: '28f74cfc56921654becb2465f8d68e135511b4646e604629baa0c2412ff6e1b4',
+      fingerprint: 'a58be65635c9444dbbffe97fea9dc95fe6e3c50613991d8c5523eb016cc42d55',
     },
   },
   // The same contract with reassignments in branches and loops forced to the 'replace' strategy

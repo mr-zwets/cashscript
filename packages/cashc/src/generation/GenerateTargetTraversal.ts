@@ -672,8 +672,10 @@ export default class GenerateTargetTraversal extends AstTraversal {
 
   // Restore a scope's entry layout: drop what the scope added (scoped declarations, the old slots of renamed
   // reassignments), then, if reorder is set, roll the variables that moved back into their entry order.
-  private reconcileStack(target: string[], node: Node, reorder: boolean = true): void {
-    const locationData = { location: node.location, positionHint: PositionHint.END };
+  private reconcileStack(
+    target: string[], node: Node, reorder: boolean = true, positionHint: PositionHint = PositionHint.END,
+  ): void {
+    const locationData = { location: node.location, positionHint };
     const tagStartIndex = this.output.length;
 
     this.stack.filter((name) => !target.includes(name)).forEach((name) => {
@@ -703,27 +705,35 @@ export default class GenerateTargetTraversal extends AstTraversal {
 
   // Branches and loops are compiled with both reassignment strategies (unless forced or nested too deep),
   // keeping the cheaper one: renaming wins big for deep loop-carried variables, while replacing stays
-  // cheaper for shallow ones, where the peephole optimiser shortens emitReplace's shuffles.
-  private chooseScopedReassignment(node: Node, emitScope: () => void): void {
+  // cheaper for shallow ones, where the peephole optimiser shortens emitReplace's shuffles. Loops also try
+  // renaming with a relaid-out loop head (see relayoutLoopHead).
+  private chooseScopedReassignment(node: Node, emitScope: (relayoutLoopHead: boolean) => void): void {
     const outerStrategy = this.scopedReassignment;
     const forcedStrategy = this.compilerOptions.scopedReassignment;
 
     if (forcedStrategy || this.scopeDepth >= MAX_REASSIGNMENT_TRIAL_DEPTH || !containsReassignment(node)) {
       this.scopedReassignment = forcedStrategy ?? outerStrategy;
-      emitScope();
+      emitScope(false);
       this.scopedReassignment = outerStrategy;
       return;
     }
 
+    const isLoop = node instanceof ForNode || node instanceof WhileNode || node instanceof DoWhileNode;
+    const options = [
+      { strategy: 'replace' as const, relayoutLoopHead: false },
+      { strategy: 'rename' as const, relayoutLoopHead: false },
+      ...(isLoop ? [{ strategy: 'rename' as const, relayoutLoopHead: true }] : []),
+    ];
+
     const start = this.saveState();
-    const candidates = (['replace', 'rename'] as const).map((strategy) => {
+    const candidates = options.map(({ strategy, relayoutLoopHead }) => {
       this.restoreState(start);
       this.scopedReassignment = strategy;
-      emitScope();
+      emitScope(relayoutLoopHead);
       return { state: this.saveState(), cost: this.costSince(start.output.length) };
     });
 
-    // Ties keep 'replace'
+    // Ties keep the earliest option ('replace' first)
     const best = candidates.reduce((a, b) => (compareCosts(b.cost, a.cost) < 0 ? b : a));
     this.restoreState(best.state);
     this.scopedReassignment = outerStrategy;
@@ -900,17 +910,24 @@ export default class GenerateTargetTraversal extends AstTraversal {
   }
 
   visitDoWhile(node: DoWhileNode): Node {
-    this.chooseScopedReassignment(node, () => this.emitDoWhile(node));
+    this.chooseScopedReassignment(node, (relayoutLoopHead) => {
+      const outerStack = [...this.stack];
+      if (relayoutLoopHead) this.relayoutLoopHead(node, () => this.emitDoWhile(node));
+      this.emitDoWhile(node);
+      if (relayoutLoopHead) this.reconcileStack(outerStack, node);
+    });
     return node;
   }
 
-  private emitDoWhile(node: DoWhileNode): void {
+  // Returns the layout at the end of the loop body, before it is reconciled (see relayoutLoopHead)
+  private emitDoWhile(node: DoWhileNode): string[] {
     this.scopeDepth += 1;
     this.emit(Op.OP_BEGIN, { location: node.location, positionHint: PositionHint.START });
 
     // Every iteration ends in the layout the loop was entered with
     const entryStack = this.snapshotStack();
     node.block = this.visit(node.block);
+    const exitStack = [...this.stack];
     this.reconcileStack(entryStack, node.block);
 
     node.condition = this.visit(node.condition);
@@ -920,14 +937,21 @@ export default class GenerateTargetTraversal extends AstTraversal {
     this.popFromStack();
 
     this.scopeDepth -= 1;
+    return exitStack;
   }
 
   visitWhile(node: WhileNode): Node {
-    this.chooseScopedReassignment(node, () => this.emitWhile(node));
+    this.chooseScopedReassignment(node, (relayoutLoopHead) => {
+      const outerStack = [...this.stack];
+      if (relayoutLoopHead) this.relayoutLoopHead(node, () => this.emitWhile(node));
+      this.emitWhile(node);
+      if (relayoutLoopHead) this.reconcileStack(outerStack, node);
+    });
     return node;
   }
 
-  private emitWhile(node: WhileNode): void {
+  // Returns the layout at the end of the loop body, before it is reconciled (see relayoutLoopHead)
+  private emitWhile(node: WhileNode): string[] {
     this.scopeDepth += 1;
     this.emit(Op.OP_BEGIN, { location: node.location, positionHint: PositionHint.START });
 
@@ -942,19 +966,21 @@ export default class GenerateTargetTraversal extends AstTraversal {
 
     const bodyEntryStack = this.snapshotStack();
     node.block = this.visit(node.block) as BlockNode;
+    const exitStack = [...this.stack];
     this.reconcileStack(bodyEntryStack, node.block);
 
     this.emitLoopCondition(node);
 
     this.scopeDepth -= 1;
+    return exitStack;
   }
 
   visitFor(node: ForNode): Node {
-    this.chooseScopedReassignment(node, () => this.emitFor(node));
+    this.chooseScopedReassignment(node, (relayoutLoopHead) => this.emitFor(node, relayoutLoopHead));
     return node;
   }
 
-  private emitFor(node: ForNode): void {
+  private emitFor(node: ForNode, relayoutLoopHead: boolean): void {
     // If the init is a re-assignment, we need to increment the scope depth so it gets treated as a scoped reassignment
     // (and therefore the stack value gets properly replaced)
     const isReassignment = node.init instanceof AssignNode;
@@ -967,6 +993,16 @@ export default class GenerateTargetTraversal extends AstTraversal {
     const forScopeStack = this.snapshotStack()
       .filter((name) => !(node.init instanceof VariableDefinitionNode && name === node.init.name));
 
+    if (relayoutLoopHead) this.relayoutLoopHead(node, () => this.emitForLoop(node));
+    this.emitForLoop(node);
+
+    // After the loop the loop variable goes. A relaid-out loop head is also put back in order, which keeps
+    // the code after the loop unaffected; otherwise an enclosing scope restores the order if it needs to.
+    this.reconcileStack(forScopeStack, node, relayoutLoopHead);
+  }
+
+  // Returns the layout at the end of the loop body and update, before it is reconciled (see relayoutLoopHead)
+  private emitForLoop(node: ForNode): string[] {
     this.scopeDepth += 1;
     this.emit(Op.OP_BEGIN, { location: node.location, positionHint: PositionHint.START });
 
@@ -988,13 +1024,32 @@ export default class GenerateTargetTraversal extends AstTraversal {
     this.sourceTags.push({ startIndex: updateStartIndex, endIndex: updateEndIndex, kind: SourceTagKind.FOR_UPDATE });
 
     // Every iteration (body and update) ends in the layout the loop was entered with
+    const exitStack = [...this.stack];
     this.reconcileStack(bodyEntryStack, node.block);
 
     this.emitLoopCondition(node);
 
-    // After the loop only the loop variable has to go; an enclosing scope restores the order if it needs to
     this.scopeDepth -= 1;
-    this.reconcileStack(forScopeStack, node, false);
+    return exitStack;
+  }
+
+  // Renaming leaves reassigned loop-carried variables in a different order at the end of the body than at
+  // the loop head, so every iteration pays for rolling them back. Instead, the loop head can take the order
+  // they have at the end of the body: compile the loop once to see that order, then discard it and permute
+  // the stack into that order once before the loop. When the body reassigns the same variables in the same
+  // order every iteration, this layout is a fixed point and the per-iteration reconcile only drops values.
+  // The caller puts the stack back in its original order after the loop.
+  private relayoutLoopHead(node: Node, emitLoop: () => string[]): void {
+    const beforeLoop = this.saveState();
+    const exitStack = emitLoop();
+    this.restoreState(beforeLoop);
+
+    const exitPosition = (name: string): number => {
+      const index = exitStack.indexOf(name);
+      return index === -1 ? Infinity : index;
+    };
+    const headLayout = [...this.stack].sort((a, b) => exitPosition(a) - exitPosition(b));
+    this.reconcileStack(headLayout, node, true, PositionHint.START);
   }
 
   // Emits the loop-back epilogue shared by while- and for-loops: OP_ENDIF closes the body branch,

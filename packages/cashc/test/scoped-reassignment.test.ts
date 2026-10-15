@@ -163,6 +163,31 @@ const CASES: Case[] = [
       return a + b + c + d + e + f;
     },
   },
+  {
+    name: 'a loop whose body reassigns deep variables in a fixed order',
+    code: `
+      contract Horner() {
+        function spend(int n, int expected, bytes unused pad) {
+          int k0 = n; int k1 = 1; int k2 = 2; int k3 = 3; int k4 = 4; int k5 = 5;
+          for (int t = 0; t < 6; t = t + 1) {
+            int b = t * 7 + n;
+            k1 = 2 * k1 + b % 2; k3 = 2 * k3 + b / 2 % 2; k5 = 2 * k5 + b / 4;
+            k0 = 3 * k0 + b % 3; k2 = 3 * k2 + b / 3 % 3; k4 = 3 * k4 + b / 9;
+          }
+          require(k0 + k1 * 3 + k2 * 5 + k3 * 7 + k4 * 11 + k5 * 13 == expected);
+        }
+      }`,
+    reference: (n) => {
+      let k0 = n; let k1 = 1n; let k2 = 2n; let k3 = 3n; let k4 = 4n; let k5 = 5n;
+      // VM division and modulo truncate towards zero, like BigInt
+      for (let t = 0n; t < 6n; t += 1n) {
+        const b = t * 7n + n;
+        k1 = 2n * k1 + (b % 2n); k3 = 2n * k3 + ((b / 2n) % 2n); k5 = 2n * k5 + b / 4n;
+        k0 = 3n * k0 + (b % 3n); k2 = 3n * k2 + ((b / 3n) % 3n); k4 = 3n * k4 + b / 9n;
+      }
+      return k0 + k1 * 3n + k2 * 5n + k3 * 7n + k4 * 11n + k5 * 13n;
+    },
+  },
 ];
 
 const STRATEGIES: Array<InternalCompilerOptions['scopedReassignment']> = ['replace', 'rename', undefined];
@@ -218,5 +243,17 @@ describe('scoped reassignment', () => {
 
     expect(loopBody(renamed)).not.toContain('OP_TOALTSTACK OP_SWAP');
     expect(loopBody(renamed).split(' ').length).toBeLessThan(loopBody(replaced).split(' ').length);
+  });
+
+  it('lays out the loop head in the order the body leaves its variables in', () => {
+    const code = CASES.find((c) => c.name.startsWith('a loop whose body'))!.code;
+
+    // Forcing 'rename' skips the relayout, so its body has to roll the variables back every iteration
+    const relaidOut = compileString(code).bytecode;
+    const renamed = compileString(code, { scopedReassignment: 'rename' }).bytecode;
+    const loopBody = (asm: string): string[] => asm.slice(asm.indexOf('OP_BEGIN'), asm.indexOf('OP_UNTIL')).split(' ');
+
+    expect(relaidOut.indexOf('OP_BEGIN')).toBeGreaterThan(renamed.indexOf('OP_BEGIN'));
+    expect(loopBody(relaidOut).length).toBeLessThan(loopBody(renamed).length);
   });
 });
