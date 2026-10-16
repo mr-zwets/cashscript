@@ -959,6 +959,10 @@ export default class GenerateTargetTraversal extends AstTraversal {
 
   // Returns the layout at the end of the loop body, before it is reconciled (see relayoutLoopHead)
   private emitWhile(node: WhileNode): string[] {
+    if (this.compilerOptions.loopInversion !== false) return this.emitInvertedLoop(node, () => {
+      node.block = this.visit(node.block) as BlockNode;
+    });
+
     this.scopeDepth += 1;
     this.emit(Op.OP_BEGIN, { location: node.location, positionHint: PositionHint.START });
 
@@ -980,6 +984,62 @@ export default class GenerateTargetTraversal extends AstTraversal {
 
     this.scopeDepth -= 1;
     return exitStack;
+  }
+
+  // Loop inversion: test the condition once on entry, then run the body as a do-while that tests
+  // it again at the bottom:
+  //   <cond> OP_IF OP_BEGIN <body> [<update>] <cond> OP_NOT OP_UNTIL OP_ENDIF
+  // instead of testing at the top of every iteration and carrying the result over the body on the
+  // altstack (OP_DUP OP_TOALTSTACK OP_IF ... OP_ENDIF OP_FROMALTSTACK), which saves five
+  // instructions per iteration. The entry test is dropped when it is known to pass (a for-loop
+  // whose literal start already satisfies its literal bound).
+  private emitInvertedLoop(node: WhileNode | ForNode, emitBodyAndUpdate: () => void): string[] {
+    this.scopeDepth += 1;
+    const guarded = !(node instanceof ForNode && this.forLoopEntersOnce(node));
+    if (guarded) {
+      node.condition = this.visit(node.condition);
+      this.popFromStack();
+      this.emit(Op.OP_IF, { location: node.block.location, positionHint: PositionHint.START });
+    }
+    this.emit(Op.OP_BEGIN, { location: node.location, positionHint: PositionHint.START });
+
+    // Every iteration (body and update) ends in the layout the loop was entered with
+    const bodyEntryStack = this.snapshotStack();
+    emitBodyAndUpdate();
+    const exitStack = [...this.stack];
+    this.reconcileStack(bodyEntryStack, node.block);
+
+    const tagStartIndex = this.output.length;
+    node.condition = this.visit(node.condition);
+    this.emit(Op.OP_NOT, { location: node.location, positionHint: PositionHint.END });
+    this.emit(Op.OP_UNTIL, { location: node.location, positionHint: PositionHint.END });
+    this.popFromStack();
+    if (guarded) this.emit(Op.OP_ENDIF, { location: node.block.location, positionHint: PositionHint.END });
+    this.sourceTags.push({
+      startIndex: tagStartIndex,
+      endIndex: this.output.length - 1,
+      kind: SourceTagKind.LOOP_CONDITION,
+    });
+
+    this.scopeDepth -= 1;
+    return exitStack;
+  }
+
+  // `for (int i = <a>; i <op> <b>; ...)` with integer literals a, b: the first test is decidable.
+  private forLoopEntersOnce(node: ForNode): boolean {
+    const { init, condition } = node;
+    if (!(init instanceof VariableDefinitionNode) || !(init.expression instanceof IntLiteralNode)) return false;
+    if (!(condition instanceof BinaryOpNode) || !(condition.left instanceof IdentifierNode)) return false;
+    if (condition.left.name !== init.name || !(condition.right instanceof IntLiteralNode)) return false;
+    const a = init.expression.value, b = condition.right.value;
+    switch (condition.operator) {
+      case BinaryOperator.LT: return a < b;
+      case BinaryOperator.LE: return a <= b;
+      case BinaryOperator.GT: return a > b;
+      case BinaryOperator.GE: return a >= b;
+      case BinaryOperator.NE: return a !== b;
+      default: return false;
+    }
   }
 
   visitFor(node: ForNode): Node {
@@ -1010,6 +1070,14 @@ export default class GenerateTargetTraversal extends AstTraversal {
 
   // Returns the layout at the end of the loop body and update, before it is reconciled (see relayoutLoopHead)
   private emitForLoop(node: ForNode): string[] {
+    if (this.compilerOptions.loopInversion !== false) return this.emitInvertedLoop(node, () => {
+      node.block = this.visit(node.block) as BlockNode;
+      const updateStartIndex = this.output.length;
+      node.update = this.visit(node.update) as AssignNode;
+      const updateEndIndex = this.output.length - 1;
+      this.sourceTags.push({ startIndex: updateStartIndex, endIndex: updateEndIndex, kind: SourceTagKind.FOR_UPDATE });
+    });
+
     this.scopeDepth += 1;
     this.emit(Op.OP_BEGIN, { location: node.location, positionHint: PositionHint.START });
 

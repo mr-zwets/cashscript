@@ -82,6 +82,7 @@ import {
   decodeInt,
   encodeInt,
   generateSourceMap,
+  optimiseBytecode,
   scriptToBytecode,
   sourceMapToLocationData,
 } from '@cashscript/utils';
@@ -629,6 +630,18 @@ function peephole(script: Script): Script {
   return ops;
 }
 
+// The rescheduled blocks of a body are emitted and peepholed one at a time, so redundancies that
+// straddle a block boundary (OP_SWAP | OP_SWAP, OP_DROP | OP_DROP, ...) survive the local
+// peephole above. Run the main bytecode optimiser over the stitched body once more. Body debug
+// frames use coarse whole-function source locations, so placeholder location data suffices.
+function reoptimiseBody(script: Script): Script {
+  const location: SingleLocationData = {
+    location: { start: { line: 0, column: 0 }, end: { line: 0, column: 0 } },
+    positionHint: PositionHint.START,
+  };
+  return optimiseBytecode(script, script.map(() => location), [], [], [], [], 0).script;
+}
+
 // ---------- cost models ----------
 
 // Static estimate of the schedule-dependent part of the BCH2026 op-cost meter. Value ops'
@@ -1004,9 +1017,9 @@ function rescheduleBodies(
       strategies.forEach((strategy) => {
         let candidate: Script;
         try {
-          candidate = recompileScript(original, arities, arity.in, strategy, objective, {
+          candidate = reoptimiseBody(recompileScript(original, arities, arity.in, strategy, objective, {
             entryPerm: perm as number[] | undefined, calleePerms: perms,
-          }).script;
+          }).script);
         } catch { return; }
         const cost = bodyCost(candidate, identity ? undefined : (perm as number[]));
         const effective = identity ? cost : cost * LAYOUT_HYSTERESIS;

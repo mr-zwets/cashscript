@@ -43,5 +43,7 @@ function artifactCompilerOptions(compilerOptions: InternalCompilerOptions = {}):
   const mergedOptions: InternalCompilerOptions = { ...DEFAULT_COMPILER_OPTIONS, ...compilerOptions };
   delete mergedOptions.disableInlining;
   delete mergedOptions.scopedReassignment;
+  delete mergedOptions.loopInversion;
+  delete mergedOptions.constantHoisting;
   return mergedOptions;
 }

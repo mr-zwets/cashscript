@@ -606,9 +606,13 @@ const CONTRACT_TEST_OPERATION_COST_OVERRUN = `
 contract Test() {
   function spend(int rounds, bytes unused padding) {
     bytes32 digest = sha256(0x00);
+    int work = 1;
     for (int i = 0; i < rounds; i = i + 1) {
       digest = sha256(digest);
+      // non-hash work per round, so the operation cost (not the hashing density) runs out first
+      work = (work * 3 + i) % 1000003;
     }
+    require(work >= 0);
     require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode, "Output 0 must pay back to the contract");
     require(tx.outputs[0].value >= 1000, "Output 0 must keep 1000 sats");
   }

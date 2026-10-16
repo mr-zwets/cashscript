@@ -99,6 +99,13 @@ export interface InternalCompilerOptions extends CompilerOptions {
   // Force one code generation strategy for reassignments inside branches and loops instead of
   // keeping the cheaper one per scope (see chooseScopedReassignment). For tests and tooling.
   scopedReassignment?: ScopedReassignment;
+  // Emit while- and for-loops in inverted form (one entry test, then a do-while that re-tests at
+  // the bottom) instead of testing at the top of every iteration. Default true. For tests and tooling.
+  loopInversion?: boolean;
+  // Force a constant hoisting mode instead of the objective default ('size': the smaller of
+  // 'all' and none; 'opcost': none). 'frequency' keeps literal pushes at hot occurrences and
+  // shares one binding among cold ones (see hoistByFrequency). For experiments and tooling.
+  constantHoisting?: 'off' | 'all' | 'frequency';
 }
 
 export type ScopedReassignment = 'replace' | 'rename';
@@ -106,7 +113,7 @@ export type ScopedReassignment = 'replace' | 'rename';
 // The AST rewrites applied before semantic analysis in a single compile candidate.
 interface RewriteFlags {
   sinkDefs: boolean;
-  hoistConstants: boolean;
+  hoistConstants: boolean | 'frequency';
 }
 
 export function compileStringInternal(
@@ -134,6 +141,11 @@ function compileCode(
   compilerOptions: CompileOptions & InternalCompilerOptions,
 ): Artifact {
   const optimizeFor = compilerOptions.optimizeFor ?? DEFAULT_COMPILER_OPTIONS.optimizeFor;
+  const forced = compilerOptions.constantHoisting;
+  if (forced !== undefined) {
+    const hoistConstants = forced === 'frequency' ? 'frequency' : forced === 'all';
+    return compileImpl(code, resolver, compilerOptions, { sinkDefs: false, hoistConstants });
+  }
   if (optimizeFor !== 'size') {
     return compileImpl(code, resolver, compilerOptions, { sinkDefs: false, hoistConstants: false });
   }
@@ -163,7 +175,7 @@ function compileImpl(
     // consumed in compileCode (which picks the smallest rewrite combination); destructured here
     // only to keep them out of the serialized artifact options
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    disableDefSinking, disableConstantHoisting, scopedReassignment,
+    disableDefSinking, disableConstantHoisting, scopedReassignment, loopInversion, constantHoisting,
     ...artifactCompilerOptions
   } = compilerOptions;
   const mergedCompilerOptions = { ...DEFAULT_COMPILER_OPTIONS, ...artifactCompilerOptions };
@@ -177,7 +189,7 @@ function compileImpl(
   // Under the 'size' objective, bind repeated in-body literals to locals (see CompilerOptions).
   // Runs before semantic analysis so the introduced locals get symbols like any other variable.
   if (rewrites.hoistConstants) {
-    ast = hoistRepeatedConstants(ast) as Ast;
+    ast = hoistRepeatedConstants(ast, rewrites.hoistConstants === 'frequency' ? 'frequency' : 'all') as Ast;
   }
 
   // Sink variable definitions to just before their first use
@@ -210,7 +222,9 @@ function compileImpl(
   ast = ast.accept(new DeadCodeEliminationTraversal()) as Ast;
 
   // Code generation
-  const traversal = new GenerateTargetTraversal({ ...mergedCompilerOptions, disableInlining, scopedReassignment });
+  const traversal = new GenerateTargetTraversal({
+    ...mergedCompilerOptions, disableInlining, scopedReassignment, loopInversion,
+  });
   ast = ast.accept(traversal) as Ast;
 
   // Bytecode optimisation
@@ -236,6 +250,13 @@ function compileImpl(
       objective: mergedCompilerOptions.optimizeFor ?? 'opcost',
       constructorParamLength,
     }));
+    // The rescheduler re-emits blocks one at a time, so redundancies across block boundaries
+    // (OP_SWAP OP_SWAP, OP_DROP OP_DROP, ...) are left for a final pass of the main optimiser,
+    // which keeps the source map, logs, requires and tags in step.
+    const { script, locationData, logs, requires, sourceTags, inlineRanges } = optimisationResult;
+    optimisationResult = optimiseBytecode(
+      script, locationData, logs, requires, sourceTags, inlineRanges, constructorParamLength,
+    );
   }
 
   const debug = {

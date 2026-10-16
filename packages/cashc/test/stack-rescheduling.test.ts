@@ -3,7 +3,9 @@ import {
   createVirtualMachineBch2026,
   hexToBin,
 } from '@bitauth/libauth';
-import { asmToBytecode, bytecodeToScript, encodeInt, scriptToBytecode } from '@cashscript/utils';
+import {
+  asmToBytecode, bytecodeToScript, encodeInt, Op, optimiseBytecode, Script, scriptToBytecode,
+} from '@cashscript/utils';
 import { compileString } from '../src/index.js';
 
 const vm = createVirtualMachineBch2026(false);
@@ -163,4 +165,57 @@ describe('dead computation is never eliminated', () => {
       expect(evaluate(rescheduled.bytecode, [0n])).toBe(false);
     },
   );
+});
+
+// Elliptic-curve mixed addition over BN254 (from a Groth16 vk_x MSM): the rescheduled helper body is
+// stitched from several blocks, and redundancies across block boundaries (OP_SWAP OP_SWAP,
+// OP_DROP OP_DROP) used to survive in it
+const P = '21888242871839275222246405745257275088696311157297823662689037894645226208583';
+const MADD_CONTRACT = `
+  function madd(int aX, int aY, int aZ, int bX, int bY) returns (int, int, int) {
+    int z1z1 = (aZ * aZ) % ${P};
+    int u2 = (bX * z1z1) % ${P};
+    require(u2 != aX);
+    int s2 = (z1z1 * aZ % ${P} * bY) % ${P};
+    int h = u2 + ${P} - aX;
+    int rr = s2 + ${P} - aY;
+    int hh = (h * h) % ${P}; int hhh = (h * hh) % ${P};
+    int vv = (hh * aX) % ${P};
+    int nx = (rr * rr + ${3n * BigInt(P)} - hhh - 2 * vv) % ${P};
+    int ny = ((vv - nx + ${P}) * rr + ${BigInt(P) * BigInt(P)} - aY * hhh) % ${P};
+    int nz = (aZ * h) % ${P};
+    return nx, ny, nz;
+  }
+  contract Madd() {
+    function spend(int x, int y, int z) {
+      (int a, int b, int c) = madd(x, y, z, 5, 7);
+      (a, b, c) = madd(a, b, c, 11, 13);
+      require(a + b + c > 0);
+    }
+  }
+`;
+
+// the main script and every OP_DEFINE'd body, as separate scripts
+function scriptsOf(bytecode: Uint8Array): Script[] {
+  const script = bytecodeToScript(bytecode);
+  const bodies: Script[] = [];
+  let i = 0;
+  while (i + 2 < script.length && script[i] instanceof Uint8Array && script[i + 2] === Op.OP_DEFINE) {
+    bodies.push(bytecodeToScript(script[i] as Uint8Array));
+    i += 3;
+  }
+  return [script.slice(i), ...bodies];
+}
+
+describe('rescheduled output is re-optimised', () => {
+  it('leaves nothing for the main bytecode optimiser in the main script or any body', () => {
+    [CONTRACT, MADD_CONTRACT].forEach((source) => {
+      const artifact = compileString(source, { rescheduleStacks: true, disableInlining: true });
+      scriptsOf(hexToBin(artifact.debug!.bytecode)).forEach((script) => {
+        const location = { location: { start: { line: 0, column: 0 }, end: { line: 0, column: 0 } }, positionHint: 0 };
+        const optimised = optimiseBytecode(script, script.map(() => location), [], [], [], [], 0).script;
+        expect(scriptToBytecode(optimised)).toEqual(scriptToBytecode(script));
+      });
+    });
+  });
 });

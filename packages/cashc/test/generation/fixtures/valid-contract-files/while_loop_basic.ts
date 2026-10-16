@@ -6,6 +6,27 @@ export const fixtures: Fixture[] = [
       contractName: 'WhileLoopBasic',
       constructorInputs: [],
       abi: [{ name: 'spend', inputs: [] }],
+      bytecode: 'OP_0 OP_DUP OP_3 OP_LESSTHAN OP_IF OP_BEGIN OP_1ADD OP_DUP OP_3 OP_GREATERTHANOREQUAL OP_UNTIL OP_ENDIF OP_3 OP_NUMEQUAL',
+      debug: {
+        bytecode: '0076539f63658b7653a26668539c',
+        sourceMap: '3:16:3:17;5:15:5:16;:19::20;:15:::1;:22:7:9:0;:8;6:12:6:22:1;5:15:5:16:0;:19::20;:8:7:9:1;;:22;9:21:9:22:0;:8::24:1',
+        logs: [],
+        requires: [
+          { ip: 14, line: 9 },
+        ],
+        sourceTags: '7:11:lc',
+      },
+      fingerprint: '36126a31e5268f237743a5d1dbf82950bcb8d9d16e30f9116e46f60afc1b0991',
+    },
+  },
+  {
+    // The same contract with loop inversion disabled: the condition is tested at the top of every
+    // iteration and carried over the body on the altstack
+    compilerOptions: { loopInversion: false },
+    artifact: {
+      contractName: 'WhileLoopBasic',
+      constructorInputs: [],
+      abi: [{ name: 'spend', inputs: [] }],
       bytecode: 'OP_0 OP_BEGIN OP_DUP OP_3 OP_LESSTHAN OP_DUP OP_TOALTSTACK OP_IF OP_1ADD OP_ENDIF OP_FROMALTSTACK OP_NOT OP_UNTIL OP_3 OP_NUMEQUAL',
       debug: {
         bytecode: '006576539f766b638b686c9166539c',

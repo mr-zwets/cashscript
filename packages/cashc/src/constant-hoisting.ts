@@ -19,6 +19,10 @@ import {
   TimeOpNode,
   ExpressionNode,
   Node,
+  ForNode,
+  WhileNode,
+  DoWhileNode,
+  AssignNode,
 } from './ast/AST.js';
 import { BinaryOperator, UnaryOperator } from './ast/Operator.js';
 import { GlobalFunction } from './ast/Globals.js';
@@ -45,10 +49,145 @@ import AstTraversal from './ast/AstTraversal.js';
 // (see ExcludedLiteralCollector). The pass is additionally guarded in compileCode: the hoisted
 // compile is only kept when the final artifact is strictly smaller than the unhoisted one.
 
-export function hoistRepeatedConstants(ast: SourceFileNode): SourceFileNode {
-  ast.functions.forEach((func) => hoistInBody(func.body, func.parameters));
-  ast.contract?.functions.forEach((func: FunctionDefinitionNode) => hoistInBody(func.body, func.parameters));
+// 'all': hoist every repeated literal of a body whose duplicates pay for the binding (bytes only).
+// 'frequency': decide per occurrence, from how often it executes (see hoistByFrequency).
+export type HoistMode = 'all' | 'frequency';
+
+export function hoistRepeatedConstants(ast: SourceFileNode, mode: HoistMode = 'all'): SourceFileNode {
+  const frequencies = mode === 'frequency' ? functionFrequencies(ast) : undefined;
+  ast.functions.forEach((func) => hoistInBody(func.body, func.parameters, mode, frequencies?.get(func.name) ?? 1));
+  ast.contract?.functions.forEach((func: FunctionDefinitionNode) => hoistInBody(func.body, func.parameters, mode, 1));
   return ast;
+}
+
+// ---------- execution frequency estimates ----------
+
+// Trip count assumed for a loop whose bounds are not literals.
+const DEFAULT_TRIPS = 16;
+// One byte of unlocking bytecode buys 800 op-cost of budget ((41 + bytes) * 800 per input), so a
+// change that saves b bytes and costs c op-cost pays when 800 * b > c, whether or not the input
+// is op-bound (an op-bound input buys the extra op-cost back with zero-padding at that rate).
+const OP_COST_PER_BYTE = 800;
+// A stack read in place of a literal push costs one extra instruction (the depth push), ~101.
+const READ_EXTRA_OP_COST = 101;
+
+// `for (int i = a; i < b; i = i + s)` (or `<=`) with literals a, b, s: the exact trip count.
+function tripCount(node: ForNode): number {
+  const { init, condition, update } = node;
+  if (!(init instanceof VariableDefinitionNode) || !(init.expression instanceof IntLiteralNode)) return DEFAULT_TRIPS;
+  if (!(condition instanceof BinaryOpNode) || !(condition.right instanceof IntLiteralNode)) return DEFAULT_TRIPS;
+  if (!(condition.left instanceof IdentifierNode) || condition.left.name !== init.name) return DEFAULT_TRIPS;
+  const step = update instanceof AssignNode && update.identifier.name === init.name
+    && update.expression instanceof BinaryOpNode && update.expression.operator === BinaryOperator.PLUS
+    && update.expression.left instanceof IdentifierNode && update.expression.left.name === init.name
+    && update.expression.right instanceof IntLiteralNode ? update.expression.right.value : 0n;
+  if (step <= 0n) return DEFAULT_TRIPS;
+  const start = init.expression.value;
+  const bound = condition.right.value;
+  let span = -1n;
+  if (condition.operator === BinaryOperator.LT) span = bound - start;
+  else if (condition.operator === BinaryOperator.LE) span = bound - start + 1n;
+  return span < 0n ? DEFAULT_TRIPS : Number((span + step - 1n) / step);
+}
+
+// Tracks how many times the node being visited executes per execution of the enclosing body.
+class LoopWeightedTraversal extends AstTraversal {
+  protected weight = 1;
+
+  private weighted<T>(factor: number, visit: () => T): T {
+    const outer = this.weight;
+    this.weight = outer * factor;
+    try {
+      return visit();
+    } finally {
+      this.weight = outer;
+    }
+  }
+
+  visitFor(node: ForNode): Node {
+    node.init = this.visit(node.init) as VariableDefinitionNode | AssignNode;
+    return this.weighted(tripCount(node), () => {
+      node.condition = this.visit(node.condition);
+      node.update = this.visit(node.update) as AssignNode;
+      node.block = this.visit(node.block) as BlockNode;
+      return node;
+    });
+  }
+
+  visitWhile(node: WhileNode): Node {
+    return this.weighted(DEFAULT_TRIPS, () => super.visitWhile(node));
+  }
+
+  visitDoWhile(node: DoWhileNode): Node {
+    return this.weighted(DEFAULT_TRIPS, () => super.visitDoWhile(node));
+  }
+}
+
+class CallSiteCollector extends LoopWeightedTraversal {
+  calls: { callee: string, weight: number }[] = [];
+
+  constructor(private globalNames: Set<string>) {
+    super();
+  }
+
+  visitFunctionCall(node: FunctionCallNode): Node {
+    if (this.globalNames.has(node.identifier.name)) this.calls.push({ callee: node.identifier.name, weight: this.weight });
+    return super.visitFunctionCall(node);
+  }
+}
+
+// Executions of each global function per contract-function execution: the sum over its call
+// sites of the calling function frequency times the call site loop weight (the call graph is
+// acyclic, so iterating once per function reaches the fixed point).
+function functionFrequencies(ast: SourceFileNode): Map<string, number> {
+  const globalNames = new Set(ast.functions.map((func) => func.name));
+  const callsOf = (body: BlockNode): { callee: string, weight: number }[] => {
+    const collector = new CallSiteCollector(globalNames);
+    collector.visit(body);
+    return collector.calls;
+  };
+  const callers = [
+    ...ast.functions.map((func) => ({ name: func.name as string | undefined, calls: callsOf(func.body) })),
+    ...(ast.contract?.functions ?? []).map((func) => ({ name: undefined, calls: callsOf(func.body) })),
+  ];
+  const propagate = (frequency: Map<string, number>): Map<string, number> => {
+    const next = new Map<string, number>([...globalNames].map((name) => [name, 0]));
+    callers.forEach(({ name, calls }) => {
+      const callerFrequency = name === undefined ? 1 : frequency.get(name) ?? 0;
+      calls.forEach(({ callee, weight }) => next.set(callee, next.get(callee)! + callerFrequency * weight));
+    });
+    return next;
+  };
+  let frequency = new Map<string, number>();
+  for (let round = 0; round <= globalNames.size; round += 1) frequency = propagate(frequency);
+  return frequency;
+}
+
+// For each repeated literal, bind it to a local and read the local at the occurrences that
+// execute least often, as many as maximises 800 * (bytes saved) - (op-cost added): a hot
+// occurrence (in a loop, or in a function called from one) keeps its literal push, the cheapest
+// per execution, while cold ones share one binding. Byte accounting as in worthHoisting: k reads
+// save (k - 1) * (pushBytes - 2) - 1 bytes; the binding costs a push and a cleanup per execution
+// of the body, and each read one extra instruction per execution.
+function hoistByFrequency(
+  sites: { node: Hoistable, weight: number }[], pushBytes: number, bodyFrequency: number,
+): Hoistable[] {
+  const sorted = [...sites].sort((a, b) => a.weight - b.weight);
+  let best = 0;
+  let bestCount = 0;
+  let weightSum = 0;
+  sorted.forEach(({ weight }, index) => {
+    const count = index + 1;
+    weightSum += weight;
+    const bytesSaved = (count - 1) * (pushBytes - 2) - 1;
+    const opAdded = bodyFrequency * (READ_EXTRA_OP_COST * weightSum + 200 + pushBytes);
+    const benefit = OP_COST_PER_BYTE * bytesSaved - opAdded;
+    if (benefit > best) {
+      best = benefit;
+      bestCount = count;
+    }
+  });
+  return sorted.slice(0, bestCount).map(({ node }) => node);
 }
 
 // Exact byte accounting: replacing each duplicate push with an identifier access costs about
@@ -56,7 +195,7 @@ export function hoistRepeatedConstants(ast: SourceFileNode): SourceFileNode {
 // end-of-scope cleanup, so hoisting pays when the duplicates' push bytes beat that overhead.
 const worthHoisting = (pushBytes: number, count: number): boolean => (count - 1) * pushBytes > 2 * (count - 1) + 1;
 
-function hoistInBody(body: BlockNode, parameters: ParameterNode[]): void {
+function hoistInBody(body: BlockNode, parameters: ParameterNode[], mode: HoistMode, bodyFrequency: number): void {
   if (!body.statements || body.statements.length === 0) return;
 
   const excluded = collectExcludedLiterals(body);
@@ -67,8 +206,13 @@ function hoistInBody(body: BlockNode, parameters: ParameterNode[]): void {
   parameters.forEach((parameter) => counter.usedNames.add(parameter.name));
   counter.visit(body);
 
-  const hoisted = [...counter.literals.values()]
-    .filter(({ pushBytes, count }) => worthHoisting(pushBytes, count));
+  const selected = new Set<Node>();
+  const hoisted = [...counter.literals.values()].filter(({ pushBytes, count, sites }) => {
+    if (mode === 'all') return worthHoisting(pushBytes, count);
+    const chosen = hoistByFrequency(sites, pushBytes, bodyFrequency);
+    chosen.forEach((node) => selected.add(node));
+    return chosen.length > 0;
+  });
   if (hoisted.length === 0) return;
 
   // Fresh local names that collide with nothing already named in the body.
@@ -80,7 +224,7 @@ function hoistInBody(body: BlockNode, parameters: ParameterNode[]): void {
     n += 1;
   }
 
-  new LiteralReplacer(names, excluded).visit(body);
+  new LiteralReplacer(names, excluded, mode === 'frequency' ? selected : undefined).visit(body);
 
   // Declarations go at the very top of the body; source locations borrow from the first
   // statement so source-map generation always has a valid location to point at.
@@ -172,8 +316,11 @@ class ExcludedLiteralCollector extends AstTraversal {
 // Counts hoistable literals by value and records every name already used in the body
 // (identifiers, parameters, definitions, tuple targets), so the introduced locals cannot
 // shadow or be shadowed by anything.
-class LiteralCounter extends AstTraversal {
-  literals = new Map<string, { key: string, template: Hoistable, pushBytes: number, count: number }>();
+class LiteralCounter extends LoopWeightedTraversal {
+  literals = new Map<string, {
+    key: string, template: Hoistable, pushBytes: number, count: number, sites: { node: Hoistable, weight: number }[],
+  }>();
+
   usedNames = new Set<string>();
 
   constructor(private excluded: Set<Node>) {
@@ -184,8 +331,13 @@ class LiteralCounter extends AstTraversal {
     if (this.excluded.has(node)) return;
     const key = literalKey(node);
     const entry = this.literals.get(key);
-    if (entry) entry.count += 1;
-    else this.literals.set(key, { key, template: node, pushBytes: literalPushBytes(node), count: 1 });
+    const site = { node, weight: this.weight };
+    if (entry) {
+      entry.count += 1;
+      entry.sites.push(site);
+    } else {
+      this.literals.set(key, { key, template: node, pushBytes: literalPushBytes(node), count: 1, sites: [site] });
+    }
   }
 
   visitIntLiteral(node: IntLiteralNode): Node {
@@ -222,12 +374,14 @@ class LiteralCounter extends AstTraversal {
 // Swaps each hoisted literal occurrence for a reference to its local. The identifier takes
 // the literal's source location (same convention as constant inlining, in reverse).
 class LiteralReplacer extends AstTraversal {
-  constructor(private names: Map<string, string>, private excluded: Set<Node>) {
+  // selected: the occurrences to replace ('frequency' mode); all occurrences when undefined
+  constructor(private names: Map<string, string>, private excluded: Set<Node>, private selected?: Set<Node>) {
     super();
   }
 
   private replace(node: Hoistable): Node {
     if (this.excluded.has(node)) return node;
+    if (this.selected !== undefined && !this.selected.has(node)) return node;
     const name = this.names.get(literalKey(node));
     if (name === undefined) return node;
     const identifier = new IdentifierNode(name);
