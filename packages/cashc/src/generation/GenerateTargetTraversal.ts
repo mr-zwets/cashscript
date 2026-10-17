@@ -77,7 +77,8 @@ import {
 } from './utils.js';
 import { getCompileTimeBytes, isNumericType } from '../utils.js';
 import {
-  collectEntryReachableCalls, collectFunctionCalls, collectLoopResidentFunctions, isRecursive, shouldInline,
+  collectEntryReachableCalls, collectFunctionCalls, collectLoopConditionalFunctions, collectLoopResidentFunctions,
+  isRecursive, shouldInline,
 } from './inlining.js';
 import type { InternalCompilerOptions, ScopedReassignment } from '../compiler.js';
 
@@ -246,7 +247,11 @@ export default class GenerateTargetTraversal extends AstTraversal {
 
     const reachableCalls = [node.contract!, ...node.functions].flatMap((n) => collectFunctionCalls(n));
     const entryReachableCalls = collectEntryReachableCalls(node);
-    const loopResidentFunctions = collectLoopResidentFunctions(node);
+    // Functions kept OP_DEFINE'd because of loop stepping: by default only those called inside a
+    // repeated branch; branchAwareLoopInlining: false restores the coarser loop-resident rule.
+    const loopResident = collectLoopResidentFunctions(node);
+    const loopResidentFunctions = this.compilerOptions.branchAwareLoopInlining === false
+      ? loopResident : collectLoopConditionalFunctions(node, loopResident);
     const definedFunctions: Array<{ func: FunctionDefinitionNode, compiledResult: OptimiseBytecodeResult }> = [];
     let nextFunctionId = recursiveFunctions.length;
 

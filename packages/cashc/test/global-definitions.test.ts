@@ -214,7 +214,7 @@ describe('Inlining and shared definitions', () => {
     expect(bytecode).toContain('OP_INVOKE');
   });
 
-  it('keeps the callees of a loop-called function shared too (they would be stepped per iteration)', () => {
+  it('inlines a function called on every loop iteration, but keeps its conditionally-called callee shared', () => {
     const code = `
       function inner(int x) returns (int) { return (x * 7 + 3) * (x + 11) - 5; }
       function outer(int x) returns (int) { if (x > 5) { x = inner(x); } return x; }
@@ -226,10 +226,45 @@ describe('Inlining and shared definitions', () => {
         }
       }`;
 
-    // both outer and inner stay defined -> two OP_DEFINEs
+    // outer runs on every iteration, so inlining it steps nothing extra; inner sits in a branch of a
+    // loop-resident body (skipped on some iterations), so it stays defined -> one OP_DEFINE
     const { bytecode } = compileString(code);
-    expect(countOp(bytecode, 'OP_DEFINE')).toEqual(2);
-    expect(bytecode).toContain('OP_INVOKE');
+    expect(countOp(bytecode, 'OP_DEFINE')).toEqual(1);
+    expect(countOp(bytecode, 'OP_INVOKE')).toEqual(1);
+
+    // the coarse rule keeps every function reachable from a loop defined
+    const coarse = compileString(code, { branchAwareLoopInlining: false });
+    expect(countOp(coarse.bytecode, 'OP_DEFINE')).toEqual(2);
+  });
+
+  it('keeps a function called inside a branch of a loop body shared', () => {
+    const code = `
+      function heavy(int x) returns (int) { return (x * 7 + 3) * (x + 11) - 5; }
+      contract C() {
+        function spend(int n) {
+          int acc = n;
+          for (int i = 0; i < 10; i = i + 1) { if (acc > 5) { acc = heavy(acc); } acc = acc + 1; }
+          require(acc > 0);
+        }
+      }`;
+
+    const { bytecode } = compileString(code);
+    expect(countOp(bytecode, 'OP_DEFINE')).toEqual(1);
+  });
+
+  it('inlines a single-call function called unconditionally inside a loop', () => {
+    const code = `
+      function heavy(int x) returns (int) { return (x * 7 + 3) * (x + 11) - 5; }
+      contract C() {
+        function spend(int n) {
+          int acc = n;
+          for (int i = 0; i < 10; i = i + 1) { acc = heavy(acc) % 1000003; }
+          require(acc > 0);
+        }
+      }`;
+
+    expect(countOp(compileString(code).bytecode, 'OP_DEFINE')).toEqual(0);
+    expect(countOp(compileString(code, { branchAwareLoopInlining: false }).bytecode, 'OP_DEFINE')).toEqual(1);
   });
 
   it('keeps a tiny helper shared when its call sites are spread across contract functions', () => {

@@ -45,5 +45,6 @@ function artifactCompilerOptions(compilerOptions: InternalCompilerOptions = {}):
   delete mergedOptions.scopedReassignment;
   delete mergedOptions.loopInversion;
   delete mergedOptions.constantHoisting;
+  delete mergedOptions.branchAwareLoopInlining;
   return mergedOptions;
 }

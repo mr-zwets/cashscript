@@ -106,6 +106,9 @@ export interface InternalCompilerOptions extends CompilerOptions {
   // 'all' and none; 'opcost': none). 'frequency' keeps literal pushes at hot occurrences and
   // shares one binding among cold ones (see hoistByFrequency). For experiments and tooling.
   constantHoisting?: 'off' | 'all' | 'frequency';
+  // Keep every function called from a loop OP_DEFINE'd (the pre-co-8 rule) instead of only those
+  // called inside a branch that repeats. For tests and tooling.
+  branchAwareLoopInlining?: boolean;
 }
 
 export type ScopedReassignment = 'replace' | 'rename';
@@ -176,6 +179,7 @@ function compileImpl(
     // only to keep them out of the serialized artifact options
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     disableDefSinking, disableConstantHoisting, scopedReassignment, loopInversion, constantHoisting,
+    branchAwareLoopInlining,
     ...artifactCompilerOptions
   } = compilerOptions;
   const mergedCompilerOptions = { ...DEFAULT_COMPILER_OPTIONS, ...artifactCompilerOptions };
@@ -223,7 +227,7 @@ function compileImpl(
 
   // Code generation
   const traversal = new GenerateTargetTraversal({
-    ...mergedCompilerOptions, disableInlining, scopedReassignment, loopInversion,
+    ...mergedCompilerOptions, disableInlining, scopedReassignment, loopInversion, branchAwareLoopInlining,
   });
   ast = ast.accept(traversal) as Ast;
 

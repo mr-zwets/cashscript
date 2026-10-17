@@ -9,6 +9,7 @@ import {
 import {
   AssignNode,
   BlockNode,
+  BranchNode,
   DoWhileNode,
   ForNode,
   FunctionCallNode,
@@ -238,4 +239,86 @@ export function collectLoopResidentFunctions(node: SourceFileNode): Set<Function
   }
 
   return loopResident;
+}
+
+// The functions that must stay OP_DEFINE'd because of loop stepping: those with a call site
+// inside a branch (if/else) that repeats, i.e. a branch inside a loop body or inside the body of a
+// loop-resident function. Such a branch can be skipped on some iterations, and the VM still steps
+// (and charges 100/opcode for) an inlined body there. A call site that executes on every iteration
+// costs the same inlined as invoked, minus the 2 invoke ops, so it does not block inlining.
+// Callees need no closure: while a function stays defined, bodies inlined into it are stepped
+// only when it is invoked.
+export function collectLoopConditionalFunctions(
+  node: SourceFileNode, loopResident: Set<FunctionDefinitionNode>,
+): Set<FunctionDefinitionNode> {
+  const conditional = new Set<FunctionDefinitionNode>();
+  let loopDepth = 0;
+  let branchDepth = 0;
+  let repeatedBody = false;
+
+  // Branches only count inside the innermost repeated region, so the branch depth restarts at 0
+  // when a loop is entered (a loop inside a branch is skipped as a whole, once).
+  const inLoop = <T>(visit: () => T): T => {
+    const outerBranchDepth = branchDepth;
+    loopDepth += 1;
+    branchDepth = 0;
+    try {
+      return visit();
+    } finally {
+      loopDepth -= 1;
+      branchDepth = outerBranchDepth;
+    }
+  };
+
+  const collector = new class extends AstTraversal {
+    visitWhile(n: WhileNode): Node {
+      return inLoop(() => super.visitWhile(n));
+    }
+
+    visitDoWhile(n: DoWhileNode): Node {
+      return inLoop(() => super.visitDoWhile(n));
+    }
+
+    visitFor(n: ForNode): Node {
+      n.init = this.visit(n.init) as VariableDefinitionNode | AssignNode;
+      return inLoop(() => {
+        n.condition = this.visit(n.condition);
+        n.update = this.visit(n.update) as AssignNode;
+        n.block = this.visit(n.block) as BlockNode;
+        return n;
+      });
+    }
+
+    visitBranch(n: BranchNode): Node {
+      n.condition = this.visit(n.condition);
+      branchDepth += 1;
+      try {
+        n.ifBlock = this.visit(n.ifBlock) as BlockNode;
+        n.elseBlock = this.visitOptional(n.elseBlock) as BlockNode | undefined;
+      } finally {
+        branchDepth -= 1;
+      }
+      return n;
+    }
+
+    visitFunctionCall(n: FunctionCallNode): Node {
+      const definition = n.identifier.symbol?.definition;
+      // the branch must itself repeat: inside a loop, or anywhere in a loop-resident body
+      const repeats = loopDepth > 0 || repeatedBody;
+      if (repeats && branchDepth > 0 && definition instanceof FunctionDefinitionNode) conditional.add(definition);
+      return super.visitFunctionCall(n);
+    }
+  }();
+
+  // A branch outside any loop in a non-repeated body is stepped at most once; in a loop-resident
+  // body every branch repeats.
+  const visitBody = (body: Node, repeated: boolean): void => {
+    repeatedBody = repeated;
+    loopDepth = 0;
+    branchDepth = 0;
+    collector.visit(body);
+  };
+  node.functions.forEach((func) => visitBody(func.body, loopResident.has(func)));
+  if (node.contract) visitBody(node.contract, false);
+  return conditional;
 }
