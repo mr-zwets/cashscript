@@ -1,0 +1,552 @@
+diff --git a/packages/cashc/src/compiler.ts b/packages/cashc/src/compiler.ts
+index 61a3b0d0..239184e2 100644
+--- a/packages/cashc/src/compiler.ts
++++ b/packages/cashc/src/compiler.ts
+@@ -109,6 +109,10 @@ export interface InternalCompilerOptions extends CompilerOptions {
+   // Keep every function called from a loop OP_DEFINE'd (the pre-co-8 rule) instead of only those
+   // called inside a branch that repeats. For tests and tooling.
+   branchAwareLoopInlining?: boolean;
++  // Stack rescheduling: plan each node's operand placement together with where its producers
++  // (notably OP_INVOKE'd calls) left their results — adopt in-place operands, stage commutative
++  // operands in the cheaper order, choose nodes by exact emission cost. Default true.
++  crossCallScheduling?: boolean;
+ }
+ 
+ export type ScopedReassignment = 'replace' | 'rename';
+@@ -179,7 +183,7 @@ function compileImpl(
+     // only to keep them out of the serialized artifact options
+     // eslint-disable-next-line @typescript-eslint/no-unused-vars
+     disableDefSinking, disableConstantHoisting, scopedReassignment, loopInversion, constantHoisting,
+-    branchAwareLoopInlining,
++    branchAwareLoopInlining, crossCallScheduling,
+     ...artifactCompilerOptions
+   } = compilerOptions;
+   const mergedCompilerOptions = { ...DEFAULT_COMPILER_OPTIONS, ...artifactCompilerOptions };
+@@ -253,6 +257,7 @@ function compileImpl(
+       mainInArity: ast.contract!.functions[0].parameters.length + constructorParamLength,
+       objective: mergedCompilerOptions.optimizeFor ?? 'opcost',
+       constructorParamLength,
++      crossCallScheduling: crossCallScheduling ?? true,
+     }));
+     // The rescheduler re-emits blocks one at a time, so redundancies across block boundaries
+     // (OP_SWAP OP_SWAP, OP_DROP OP_DROP, ...) are left for a final pass of the main optimiser,
+diff --git a/packages/cashc/src/stack-rescheduling.ts b/packages/cashc/src/stack-rescheduling.ts
+index 06cfd1b2..d0cda7ba 100644
+--- a/packages/cashc/src/stack-rescheduling.ts
++++ b/packages/cashc/src/stack-rescheduling.ts
+@@ -94,6 +94,7 @@ export interface RescheduleOptions {
+   mainInArity: number; // spend parameters + constructor parameters
+   objective: 'size' | 'opcost';
+   constructorParamLength: number;
++  crossCallScheduling?: boolean; // see CROSS-CALL SCHEDULING
+ }
+ 
+ export interface RescheduleOutcome {
+@@ -345,7 +346,7 @@ function decompile(script: Script, arities: Map<number, FunctionArity>, inArity:
+ 
+ // ---------- scheduler ----------
+ 
+-type Strategy = 'topo' | 'greedy' | 'opcost' | 'beam';
++type Strategy = 'topo' | 'greedy' | 'opcost' | 'beam' | 'exact' | 'beamx';
+ 
+ const keyOf = (ref: Ref): string | undefined => {
+   if (ref.k === 'in') return `m${ref.i}`;
+@@ -429,13 +430,198 @@ function bringRef(s: EmitState, ref: Ref, consumeContext: boolean, exitNeed: Map
+   }
+ }
+ 
++// CROSS-CALL SCHEDULING (internal option `crossCallScheduling`, set for the duration of one
++// applyStackRescheduling run). An OP_INVOKE is already a single DAG node with a fixed stack
++// effect (arity.in -> arity.out); what the plain scheduler lacks is planning a node's operand
++// placement TOGETHER with where its producers left their results: it always re-fetches every
++// operand, so a callee whose arguments are already sitting on top of the stack in order (the
++// results of the previous call) still pays a full `<d> ROLL` per argument. With cross-call
++// scheduling on:
++//   * operand ADOPTION: the longest run of a node's leading operands that is already on top of
++//     the stack, in order, is consumed in place (zero moves); only the rest is fetched. The
++//     same applies to the block's exit layout.
++//   * commutative two-input prims stage whichever operand order is cheaper.
++//   * node choice uses the EXACT emission cost of computing a candidate next (clone + emit),
++//     so a producer is preferred when its results land where the consumer wants them, and a
++//     wider beam searches over those exact costs.
++let crossCall = false;
++
++const COMMUTATIVE = new Set<number>([
++  Op.OP_ADD, Op.OP_MUL, Op.OP_BOOLAND, Op.OP_BOOLOR, Op.OP_NUMEQUAL, Op.OP_NUMNOTEQUAL,
++  Op.OP_MIN, Op.OP_MAX, Op.OP_AND, Op.OP_OR, Op.OP_XOR, Op.OP_EQUAL,
++]);
++
++// ARGUMENT SYMMETRIES of OP_DEFINE'd functions, PROVEN structurally (see findSymmetries):
++//   half:  f(a, b) == f(b, a) for a = args[0..n/2), b = args[n/2..n) (addFp, mulFp, fp2Add,
++//          fp2Mul (Karatsuba), fp6Mul, fp12Mul, ...)
++//   comps: groups of argument positions any two of which may be exchanged (fp2Add: {0,2},
++//          {1,3}); every proven transposition is a symmetry, and so is any product of them.
++// Set per applyStackRescheduling run.
++interface Symmetry { half: boolean; comps: number[][] }
++let calleeSymmetries: Map<number, Symmetry> = new Map();
++
++// Canonical form of an argument list under a proven symmetry: sort within each component,
++// then take the smaller of that and the same for the half-swapped list. Each result is the
++// image of the input under a proven symmetry, so equal canonical forms imply equal values
++// (the form need not be fully canonical; missing a match only loses a proof).
++function canonicalArgs(ins: string[], sym: Symmetry): string[] {
++  const sortComps = (list: string[]): string[] => {
++    const out = [...list];
++    sym.comps.forEach((comp) => {
++      const values = comp.map((i) => out[i]).sort();
++      comp.forEach((i, k) => { out[i] = values[k]; });
++    });
++    return out;
++  };
++  const a = sortComps(ins);
++  if (!sym.half) return a;
++  const h = ins.length / 2;
++  const b = sortComps([...ins.slice(h), ...ins.slice(0, h)]);
++  return a.join(',') <= b.join(',') ? a : b;
++}
++
++// Structural proof: the callee body must lift to ONE block without control flow, altstack
++// use or dead computation. Its exit values are canonicalised (commutative prims sort their
++// operands, invokes of callees with proven symmetries use canonicalArgs, every distinct
++// subterm is interned in ONE table shared by all passes, so equal ids imply equal terms)
++// once over the identity inputs and once per candidate argument relabelling. Equal
++// canonical exits mean the relabelled call computes identical values.
++function findSymmetries(d: Dissected, arities: Map<number, FunctionArity>): Map<number, Symmetry> {
++  const proven = new Map<number, Symmetry>();
++  calleeFirstOrder(d).forEach((id) => {
++    const arity = arities.get(id);
++    if (arity === undefined || arity.in < 2) return;
++    let items: Item[];
++    try { items = decompile(d.bodies.get(id)!, arities, arity.in); } catch { return; }
++    if (items.length !== 1 || !('block' in items[0])) return;
++    const { block } = items[0];
++    if (block.entryAlt !== 0 || block.exitAlt.length !== 0 || hasDeadComputation(block)) return;
++    const n = arity.in;
++    const intern = new Map<string, number>();
++    const internOf = (str: string): number => {
++      if (!intern.has(str)) intern.set(str, intern.size);
++      return intern.get(str)!;
++    };
++    const canon = (relabel: (i: number) => number): string => {
++      const memo = new Map<number, number>();
++      const refId = (ref: Ref): string => {
++        if (ref.k === 'const') return `k${binToHex(ref.data)}`;
++        if (ref.k === 'in') return `i${relabel(ref.i)}`;
++        if (ref.k === 'ain') return `a${ref.i}`;
++        return `n${nodeId(ref.node)}_${ref.j}`;
++      };
++      const nodeId = (node: DagNode): number => {
++        const cached = memo.get(node.id);
++        if (cached !== undefined) return cached;
++        let ins = node.ins.map(refId);
++        if (node.kind === 'prim' && COMMUTATIVE.has(node.code) && ins.length === 2) ins = [...ins].sort();
++        const sym = node.kind === 'invoke' ? proven.get(node.code) : undefined;
++        if (sym !== undefined) ins = canonicalArgs(ins, sym);
++        const value = internOf(`${node.kind}${node.code}(${ins.join(',')})`);
++        memo.set(node.id, value);
++        return value;
++      };
++      return block.exit.map(refId).join('|');
++    };
++    const reference = canon((i) => i);
++    const half = n % 2 === 0 && canon((i) => (i < n / 2 ? i + n / 2 : i - n / 2)) === reference;
++    // proven transpositions -> connected components (the transpositions of a component
++    // generate the full symmetric group on it)
++    const parent = Array.from({ length: n }, (_, i) => i);
++    const find = (i: number): number => {
++      let r = i;
++      while (parent[r] !== r) r = parent[r];
++      return r;
++    };
++    for (let i = 0; i < n; i += 1) {
++      for (let j = i + 1; j < n; j += 1) {
++        if (find(i) !== find(j) && canon((x) => (x === i ? j : x === j ? i : x)) === reference) {
++          parent[find(j)] = find(i);
++        }
++      }
++    }
++    const groups = new Map<number, number[]>();
++    for (let i = 0; i < n; i += 1) groups.set(find(i), [...(groups.get(find(i)) ?? []), i]);
++    const comps = [...groups.values()].filter((g) => g.length > 1);
++    if (half || comps.length > 0) proven.set(id, { half, comps });
++  });
++  return proven;
++}
++
++// longest k such that the top k stack labels are exactly staged[0..k) and consuming them in
++// place leaves every remaining use of those values satisfiable (another copy stays below)
++function adoptablePrefix(s: EmitState, staged: Ref[], remainingUses: (key: string) => number): number {
++  const len = s.stk.length;
++  for (let k = Math.min(staged.length, len); k > 0; k -= 1) {
++    let match = true;
++    const adopted = new Map<string, number>();
++    for (let i = 0; i < k; i += 1) {
++      const key = keyOf(staged[i]);
++      if (key === undefined || s.stk[len - k + i] !== key) { match = false; break; }
++      adopted.set(key, (adopted.get(key) ?? 0) + 1);
++    }
++    if (!match) continue;
++    const below = s.stk.slice(0, len - k);
++    const ok = [...adopted].every(([key, a]) => remainingUses(key) - a <= 0 || below.includes(key));
++    if (ok) return k;
++  }
++  return 0;
++}
++
++function stageOperands(s: EmitState, staged: Ref[], exitNeed: Map<string, number>): void {
++  let adopted = 0;
++  if (crossCall) {
++    adopted = adoptablePrefix(s, staged, (key) => (s.useCount.get(key) ?? 0) + (exitNeed.get(key) ?? 0));
++    for (let i = 0; i < adopted; i += 1) {
++      const key = keyOf(staged[i])!;
++      s.useCount.set(key, (s.useCount.get(key) ?? 0) - 1);
++    }
++  }
++  staged.slice(adopted).forEach((r) => bringRef(s, r, true, exitNeed));
++}
++
+ // compute one DAG node on top of the stack, staging arguments in the callee's chosen
+ // entry order for permuted OP_INVOKE targets
+ function computeNode(s: EmitState, node: DagNode, exitNeed: Map<string, number>, calleePerms: Map<number, number[]>): void {
+   s.remaining.delete(node.id);
+   const perm = node.kind === 'invoke' ? calleePerms.get(node.code) : undefined;
+-  const staged = perm !== undefined ? perm.map((i) => node.ins[i]) : node.ins;
+-  staged.forEach((r) => bringRef(s, r, true, exitNeed));
++  let staged = perm !== undefined ? perm.map((i) => node.ins[i]) : node.ins;
++  const trial = (order: Ref[]): number => {
++    const t = cloneState(s);
++    stageOperands(t, order, new Map(exitNeed));
++    return t.cost;
++  };
++  if (crossCall && node.kind === 'prim' && COMMUTATIVE.has(node.code) && staged.length === 2) {
++    const swapped = [staged[1], staged[0]];
++    if (trial(swapped) < trial(staged)) staged = swapped;
++  }
++  const sym = crossCall && node.kind === 'invoke' ? calleeSymmetries.get(node.code) : undefined;
++  if (sym !== undefined) {
++    // relabel the LOGICAL arguments under proven symmetries (half swap, then improving
++    // transpositions within components), then apply the callee's entry permutation
++    const stage = (ins: Ref[]): Ref[] => (perm !== undefined ? perm.map((i) => ins[i]) : ins);
++    let bestIns = node.ins;
++    let bestCost = trial(staged);
++    if (sym.half) {
++      const h = node.ins.length / 2;
++      const swappedIns = [...node.ins.slice(h), ...node.ins.slice(0, h)];
++      const cost = trial(stage(swappedIns));
++      if (cost < bestCost) { bestIns = swappedIns; bestCost = cost; }
++    }
++    const transpositions = sym.comps.flatMap((comp) => comp.flatMap((i, a) => comp.slice(a + 1).map((j) => [i, j])));
++    for (let pass = 0; pass < 2; pass += 1) {
++      let improved = false;
++      for (const [i, j] of transpositions) {
++        const candidate = [...bestIns];
++        [candidate[i], candidate[j]] = [candidate[j], candidate[i]];
++        const cost = trial(stage(candidate));
++        if (cost < bestCost) { bestIns = candidate; bestCost = cost; improved = true; }
++      }
++      if (!improved) break;
++    }
++    staged = stage(bestIns);
++  }
++  stageOperands(s, staged, exitNeed);
+   if (node.kind === 'invoke') { pushNum(s, node.code); appendOp(s, Op.OP_INVOKE); } else appendOp(s, node.code);
+   s.stk.length -= node.ins.length;
+   for (let j = 0; j < node.nout; j += 1) s.stk.push(`n${node.id}_${j}`);
+@@ -449,6 +635,8 @@ interface EmitOptions {
+ const NO_PERMS: Map<number, number[]> = new Map();
+ const BEAM_WIDTH = 4;
+ const BEAM_EXPAND = 3;
++const BEAMX_WIDTH = 8;
++const BEAMX_EXPAND = 4;
+ 
+ // Re-emit one block: seed the entry slots, compute the DAG nodes in a strategy-chosen
+ // dependency order (fetching each operand with the cheapest available move/copy), then
+@@ -524,7 +712,17 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+     const desiredKeys = desired.map((r) => (r.k === 'const' ? undefined : keyOf(r)));
+     const inPlace = s.stk.length >= desired.length
+       && desiredKeys.every((dk, i) => dk !== undefined && s.stk[s.stk.length - desired.length + i] === dk);
+-    if (!inPlace) desired.forEach((r) => bringRef(s, r, false, need));
++    if (!inPlace) {
++      let adopted = 0;
++      if (crossCall) {
++        adopted = adoptablePrefix(s, desired, (key) => need.get(key) ?? 0);
++        for (let i = 0; i < adopted; i += 1) {
++          const key = keyOf(desired[i])!;
++          need.set(key, (need.get(key) ?? 0) - 1);
++        }
++      }
++      desired.slice(adopted).forEach((r) => bringRef(s, r, false, need));
++    }
+ 
+     const K = desired.length;
+     const junk = s.stk.length - K;
+@@ -543,13 +741,20 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+     if (!altPass) for (let i = 0; i < exitAlt.length; i += 1) appendOp(s, Op.OP_TOALTSTACK);
+   };
+ 
+-  if (strategy !== 'beam') {
++  // exact incremental cost of computing `nd` next (cross-call scheduling): emit it on a clone
++  const exactCost = (s: EmitState, nd: DagNode): number => {
++    const t = cloneState(s);
++    computeNode(t, nd, new Map(exitNeed), calleePerms);
++    return t.cost - s.cost;
++  };
++
++  if (strategy !== 'beam' && strategy !== 'beamx') {
+     const state = initial;
+     while (state.remaining.size > 0) {
+       const candidates = readyNodes(state);
+       let node = candidates[0];
+       if (strategy !== 'topo') {
+-        const cost = strategy === 'opcost' ? fetchCostOp : fetchCostBytes;
++        const cost = strategy === 'exact' ? exactCost : strategy === 'opcost' ? fetchCostOp : fetchCostBytes;
+         let best = cost(state, candidates[0]);
+         candidates.forEach((candidate) => {
+           const c = cost(state, candidate);
+@@ -565,14 +770,17 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+   // beam search: expand each surviving state by its BEAM_EXPAND cheapest ready nodes,
+   // keep the BEAM_WIDTH cheapest accumulated schedules (all states have computed the
+   // same number of nodes, so accumulated cost is comparable)
++  const exactBeam = strategy === 'beamx';
++  const width = exactBeam ? BEAMX_WIDTH : BEAM_WIDTH;
++  const expand = exactBeam ? BEAMX_EXPAND : BEAM_EXPAND;
+   let beam: EmitState[] = [initial];
+   for (let step = 0; step < order.length; step += 1) {
+     const next: EmitState[] = [];
+     beam.forEach((state) => {
+       const candidates = readyNodes(state)
+-        .map((nd) => ({ nd, c: fetchCostOp(state, nd) }))
++        .map((nd) => ({ nd, c: exactBeam ? exactCost(state, nd) : fetchCostOp(state, nd) }))
+         .sort((a, b) => a.c - b.c)
+-        .slice(0, BEAM_EXPAND);
++        .slice(0, expand);
+       candidates.forEach(({ nd }) => {
+         const branch = cloneState(state);
+         computeNode(branch, nd, exitNeed, calleePerms);
+@@ -580,7 +788,7 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+       });
+     });
+     next.sort((a, b) => a.cost - b.cost);
+-    beam = next.slice(0, BEAM_WIDTH);
++    beam = next.slice(0, width);
+   }
+   let best: Script | undefined;
+   let bestCost = Infinity;
+@@ -953,8 +1161,16 @@ function layoutCandidates(body: Script, arities: Map<number, FunctionArity>, inA
+   const byUseCountAsc = [...identity].sort((a, b) => (useCount[a] - useCount[b]) || (a - b));
+   const reverse = [...identity].reverse();
+ 
++  // cross-call scheduling: half-wise variants, so a two-operand callee can take each
++  // operand reversed (matching a producer's first-last results) in either operand order
++  const extra: number[][] = [];
++  if (crossCall && inArity % 2 === 0 && inArity >= 4) {
++    const h = inArity / 2;
++    const lo = identity.slice(0, h); const hi = identity.slice(h);
++    extra.push([...[...lo].reverse(), ...[...hi].reverse()], [...hi, ...lo]);
++  }
+   const seen = new Set<string>();
+-  return [identity, byFirstUseDesc, byUseCountAsc, reverse].filter((perm) => {
++  return [identity, byFirstUseDesc, byUseCountAsc, reverse, ...extra].filter((perm) => {
+     const key = perm.join(',');
+     if (seen.has(key)) return false;
+     seen.add(key);
+@@ -966,6 +1182,7 @@ function layoutCandidates(body: Script, arities: Map<number, FunctionArity>, inA
+ 
+ const BODY_STRATEGIES: Strategy[] = ['topo', 'greedy', 'opcost'];
+ const MAIN_STRATEGIES: Strategy[] = ['topo', 'greedy', 'opcost'];
++const CROSSCALL_STRATEGIES: Strategy[] = ['exact', 'beamx'];
+ // adopt a non-identity entry layout only if it beats the best identity variant by >1%
+ // (its call-site staging costs are not visible in the body-level measurement)
+ const LAYOUT_HYSTERESIS = 1.01;
+@@ -983,10 +1200,12 @@ interface BodyChoices {
+ // caller falls back to identity layouts wholesale).
+ function rescheduleBodies(
+   d: Dissected, arities: Map<number, FunctionArity>, objective: 'size' | 'opcost', layouts: boolean,
++  mainInArity?: number,
+ ): BodyChoices {
+   const overrides = new Map<number, Script>();
+   const perms = new Map<number, number[]>();
+-  const strategies: Strategy[] = layouts ? [...BODY_STRATEGIES, 'beam'] : BODY_STRATEGIES;
++  const base: Strategy[] = crossCall ? [...BODY_STRATEGIES, ...CROSSCALL_STRATEGIES] : BODY_STRATEGIES;
++  const strategies: Strategy[] = layouts ? [...base, 'beam'] : base;
+   const processing = layouts ? calleeFirstOrder(d) : d.order;
+ 
+   processing.forEach((id) => {
+@@ -1012,8 +1231,47 @@ function rescheduleBodies(
+     }
+ 
+     const candidatesPerms = layouts ? layoutCandidates(original, arities, arity.in) : [undefined];
++    // CALL-SITE-AWARE LAYOUTS (cross-call scheduling): a permuted entry layout changes how
++    // every caller stages its arguments, e.g. cashc pushes a call's arguments last-first while
++    // results come out first-last, so a chained f(g(x)) re-orders the whole tuple unless f
++    // takes its arguments reversed. Rank each layout by body cost PLUS the static cost change
++    // of re-emitting every direct caller (bodies and main) under it; a caller that cannot be
++    // re-emitted rules the layout out.
++    const callSiteDelta = new Map<string, number>();
++    const useCallSites = crossCall && layouts && mainInArity !== undefined && candidatesPerms.length > 1;
++    if (useCallSites) {
++      const callers: Array<{ script: Script; inArity: number }> = [];
++      d.order.forEach((caller) => {
++        const callerArity = arities.get(caller);
++        if (caller !== id && callerArity !== undefined && bodyInvokes(d.bodies.get(caller)!).includes(id)) {
++          callers.push({ script: d.bodies.get(caller)!, inArity: callerArity.in });
++        }
++      });
++      if (bodyInvokes(d.main).includes(id)) callers.push({ script: d.main, inArity: mainInArity! });
++      const callersCost = (calleePerms: Map<number, number[]>): number => callers.reduce((sum, caller) => {
++        let bestCaller = Infinity;
++        (['topo', 'greedy'] as Strategy[]).forEach((strategy) => {
++          try {
++            const out = recompileScript(caller.script, arities, caller.inArity, strategy, objective, { calleePerms }).script;
++            bestCaller = Math.min(bestCaller, scriptCost(out, objective));
++          } catch { /* not re-emittable under this convention */ }
++        });
++        return sum + bestCaller;
++      }, 0);
++      const baseCallers = callersCost(perms);
++      candidatesPerms.forEach((perm) => {
++        if (isIdentityPerm(perm as number[] | undefined)) return;
++        const delta = callersCost(new Map([...perms, [id, perm as number[]]])) - baseCallers;
++        callSiteDelta.set((perm as number[]).join(','), delta);
++      });
++    }
++    // measured op-cost sums 3 runs of the body (measureBody's K); weigh one static
++    // call-site estimate per run
++    const callSiteWeight = objective === 'opcost' ? 3 : 1;
+     candidatesPerms.forEach((perm) => {
+       const identity = isIdentityPerm(perm as number[] | undefined);
++      const siteDelta = identity ? 0 : (callSiteDelta.get((perm as number[]).join(',')) ?? 0);
++      if (!Number.isFinite(siteDelta)) return;
+       strategies.forEach((strategy) => {
+         let candidate: Script;
+         try {
+@@ -1022,7 +1280,8 @@ function rescheduleBodies(
+           }).script);
+         } catch { return; }
+         const cost = bodyCost(candidate, identity ? undefined : (perm as number[]));
+-        const effective = identity ? cost : cost * LAYOUT_HYSTERESIS;
++        const effective = identity ? cost
++          : useCallSites ? cost + callSiteWeight * siteDelta : cost * LAYOUT_HYSTERESIS;
+         const effectivePerm = identity ? undefined : (perm as number[]);
+         if (effective < bestCost && bodyEquiv(d, overrides, id, candidate, arity, effectivePerm)) {
+           best = candidate;
+@@ -1094,6 +1353,28 @@ export function applyStackRescheduling(
+   optimised: OptimiseBytecodeResult,
+   frames: DebugFrame[],
+   options: RescheduleOptions,
++): RescheduleOutcome {
++  const previous = crossCall;
++  const previousSymmetries = calleeSymmetries;
++  crossCall = options.crossCallScheduling ?? false;
++  calleeSymmetries = crossCall
++    ? findSymmetries(dissect(optimised.script), options.arities) : new Map();
++  if (process.env.CASHC_DEBUG_RESCHEDULE !== undefined) {
++    const list = [...calleeSymmetries].map(([id, sym]) => `${id}${sym.half ? 'h' : ''}${sym.comps.map((c) => `{${c.join(',')}}`).join('')}`);
++    console.error(`[reschedule] symmetries: ${list.join(' ')}`); // eslint-disable-line no-console
++  }
++  try {
++    return applyStackReschedulingInner(optimised, frames, options);
++  } finally {
++    crossCall = previous;
++    calleeSymmetries = previousSymmetries;
++  }
++}
++
++function applyStackReschedulingInner(
++  optimised: OptimiseBytecodeResult,
++  frames: DebugFrame[],
++  options: RescheduleOptions,
+ ): RescheduleOutcome {
+   const { arities, objective, constructorParamLength } = options;
+   const d = dissect(optimised.script);
+@@ -1116,7 +1397,7 @@ export function applyStackRescheduling(
+   const layouts = optimised.logs.length === 0 && !allScripts.some(hasAmbiguousInvoke);
+   const debug = process.env.CASHC_DEBUG_RESCHEDULE !== undefined;
+   try {
+-    choices = rescheduleBodies(d, loggableArities, objective, layouts);
++    choices = rescheduleBodies(d, loggableArities, objective, layouts, options.mainInArity);
+     if (debug && layouts) {
+       // eslint-disable-next-line no-console
+       console.error(`[reschedule] layouts: ${choices.perms.size} permuted of ${d.order.length} bodies (${[...choices.perms.keys()].join(',')})`);
+@@ -1140,7 +1421,7 @@ export function applyStackRescheduling(
+     const needsReemit = perms.size > 0 && bodyInvokes(d.main).some((id) => perms.has(id));
+     let best: RecompiledScript | undefined;
+     let bestCost = needsReemit ? Infinity : scriptCost(d.main, objective);
+-    MAIN_STRATEGIES.forEach((strategy) => {
++    (crossCall ? [...MAIN_STRATEGIES, ...CROSSCALL_STRATEGIES] : MAIN_STRATEGIES).forEach((strategy) => {
+       let candidate: RecompiledScript;
+       try {
+         candidate = recompileScript(d.main, arities, options.mainInArity, strategy, objective, { calleePerms: perms });
+diff --git a/packages/cashc/test/stack-rescheduling.test.ts b/packages/cashc/test/stack-rescheduling.test.ts
+index f511686a..5b13c351 100644
+--- a/packages/cashc/test/stack-rescheduling.test.ts
++++ b/packages/cashc/test/stack-rescheduling.test.ts
+@@ -219,3 +219,68 @@ describe('rescheduled output is re-optimised', () => {
+     });
+   });
+ });
++
++// Cross-call scheduling (crossCallScheduling, default on): operand adoption, commutative
++// staging, and half-swap symmetric callees. `addm`/`mul2` are proven symmetric and may get
++// their argument halves swapped at call sites; `subm` is not symmetric and must never be.
++const M = 1000003n;
++const CROSSCALL_CONTRACT = `
++  function addm(int a, int b) returns (int) { return (a + b) % ${M}; }
++  function subm(int a, int b) returns (int) { return (a - b + ${M}) % ${M}; }
++  function mul2(int a0, int a1, int b0, int b1) returns (int, int) {
++    int v0 = (a0 * b0) % ${M};
++    int v1 = (a1 * b1) % ${M};
++    return subm(v0, v1), subm(((a0 + a1) * (b0 + b1)) % ${M}, addm(v0, v1));
++  }
++  function t0Of(int v) returns (int) { return subm(v, 1); }
++  contract CrossCall() {
++    function spend(int x0, int x1, int y0, int y1, int w0, int w1) {
++      (int p0, int p1) = mul2(x0, x1, y0, y1);
++      (int q0, int q1) = mul2(p0, p1, x0, x1);
++      (int r0, int r1) = mul2(y0, y1, q0, q1);
++      int s = subm(r0, q1);
++      int t = subm(addm(p0, t0Of(r1)), y1);
++      require(s == w0);
++      require(t == w1);
++    }
++  }
++`;
++
++const mod = (v: bigint): bigint => ((v % M) + M) % M;
++const mul2 = (a0: bigint, a1: bigint, b0: bigint, b1: bigint): [bigint, bigint] => {
++  const v0 = mod(a0 * b0); const v1 = mod(a1 * b1);
++  return [mod(v0 - v1), mod(mod((a0 + a1) * (b0 + b1)) - mod(v0 + v1))];
++};
++const crossCallExpected = (x0: bigint, x1: bigint, y0: bigint, y1: bigint): [bigint, bigint] => {
++  const [p0, p1] = mul2(x0, x1, y0, y1);
++  const [q0, q1] = mul2(p0, p1, x0, x1);
++  const [r0, r1] = mul2(y0, y1, q0, q1);
++  return [mod(r0 - q1), mod(mod(p0 + mod(r1 - 1n)) - y1)];
++};
++
++describe('cross-call scheduling', () => {
++  it.each([['opcost'], ['size']] as const)(
++    'preserves accept/reject behaviour under the %s objective',
++    (optimizeFor) => {
++      const options = { optimizeFor, rescheduleStacks: true, disableInlining: true };
++      const plain = compileString(CROSSCALL_CONTRACT, { ...options, crossCallScheduling: false } as never);
++      const crossCall = compileString(CROSSCALL_CONTRACT, options);
++      const vectors: bigint[][] = [[3n, 5n, 7n, 11n], [999999n, 123456n, 1n, 0n], [424242n, 77n, 500000n, 1000002n]];
++      vectors.forEach(([x0, x1, y0, y1]) => {
++        const [e0, e1] = crossCallExpected(x0, x1, y0, y1);
++        [plain, crossCall].forEach((artifact) => {
++          expect(evaluate(artifact.bytecode, [x0, x1, y0, y1, e0, e1])).toBe(true);
++          expect(evaluate(artifact.bytecode, [x0, x1, y0, y1, e0, mod(e1 + 1n)])).toBe(false);
++          expect(evaluate(artifact.bytecode, [x0, x1, y0, y1, mod(e0 + 1n), e1])).toBe(false);
++        });
++      });
++    },
++  );
++
++  it('never grows the bytecode on this contract under the size objective', () => {
++    const options = { optimizeFor: 'size', rescheduleStacks: true, disableInlining: true } as const;
++    const plain = compileString(CROSSCALL_CONTRACT, { ...options, crossCallScheduling: false } as never);
++    const crossCall = compileString(CROSSCALL_CONTRACT, options);
++    expect(hexToBin(crossCall.debug!.bytecode).length).toBeLessThanOrEqual(hexToBin(plain.debug!.bytecode).length);
++  });
++});

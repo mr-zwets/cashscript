@@ -1,0 +1,1372 @@
+diff --git a/packages/cashc/src/compiler.ts b/packages/cashc/src/compiler.ts
+index 61a3b0d0..704e3279 100644
+--- a/packages/cashc/src/compiler.ts
++++ b/packages/cashc/src/compiler.ts
+@@ -3,6 +3,7 @@ import {
+   Artifact,
+   CompilerOptions,
+   computeBytecodeFingerprintWithConstructorArgs,
++  OptimiseBytecodeResult,
+   generateSourceMap,
+   generateSourceTags,
+   generateInlineRanges,
+@@ -39,6 +40,7 @@ import InjectLocktimeGuardTraversal from './semantic/InjectLocktimeGuardTraversa
+ import DeadCodeEliminationTraversal from './semantic/DeadCodeEliminationTraversal.js';
+ import { LowerGlobalConstantsTraversal } from './semantic/LowerGlobalConstantsTraversal.js';
+ import { hoistRepeatedConstants } from './constant-hoisting.js';
++import { applyBlockMoves, BlockMoveOptions, renumberFunctions } from './block-moves.js';
+ 
+ export const DEFAULT_COMPILER_OPTIONS: CompilerOptions = {
+   enforceFunctionParameterTypes: true,
+@@ -109,6 +111,12 @@ export interface InternalCompilerOptions extends CompilerOptions {
+   // Keep every function called from a loop OP_DEFINE'd (the pre-co-8 rule) instead of only those
+   // called inside a branch that repeats. For tests and tooling.
+   branchAwareLoopInlining?: boolean;
++  // Stack rescheduling: plan each node's operand placement together with where its producers
++  // (notably OP_INVOKE'd calls) left their results — adopt in-place operands, stage commutative
++  // operands in the cheaper order, choose nodes by exact emission cost. Default true.
++  crossCallScheduling?: boolean;
++  // Collapse runs of single-item fetches into looping helper calls (block-moves.ts).
++  blockMoves?: boolean | BlockMoveOptions;
+ }
+ 
+ export type ScopedReassignment = 'replace' | 'rename';
+@@ -179,7 +187,7 @@ function compileImpl(
+     // only to keep them out of the serialized artifact options
+     // eslint-disable-next-line @typescript-eslint/no-unused-vars
+     disableDefSinking, disableConstantHoisting, scopedReassignment, loopInversion, constantHoisting,
+-    branchAwareLoopInlining,
++    branchAwareLoopInlining, crossCallScheduling, blockMoves,
+     ...artifactCompilerOptions
+   } = compilerOptions;
+   const mergedCompilerOptions = { ...DEFAULT_COMPILER_OPTIONS, ...artifactCompilerOptions };
+@@ -253,6 +261,7 @@ function compileImpl(
+       mainInArity: ast.contract!.functions[0].parameters.length + constructorParamLength,
+       objective: mergedCompilerOptions.optimizeFor ?? 'opcost',
+       constructorParamLength,
++      crossCallScheduling: crossCallScheduling ?? true,
+     }));
+     // The rescheduler re-emits blocks one at a time, so redundancies across block boundaries
+     // (OP_SWAP OP_SWAP, OP_DROP OP_DROP, ...) are left for a final pass of the main optimiser,
+@@ -263,6 +272,20 @@ function compileImpl(
+     );
+   }
+ 
++  if (blockMoves) {
++    // helper specialisation and id renumbering interact (only ids 0..16 push in one byte), so
++    // both specialisation settings are run end to end and the smaller result is kept
++    const moveOptions = blockMoves === true ? {} : blockMoves;
++    const variants = (moveOptions.specialise === undefined ? [true, false] : [moveOptions.specialise])
++      .map((specialise) => {
++        let moved = applyBlockMoves(optimisationResult, frames, constructorParamLength, { ...moveOptions, specialise });
++        if (moveOptions.renumber !== false) moved = renumberFunctions(moved.result, moved.frames);
++        return moved;
++      });
++    const size = (v: { result: OptimiseBytecodeResult }): number => scriptToBytecode(v.result.script).length;
++    ({ result: optimisationResult, frames } = variants.reduce((best, v) => (size(v) < size(best) ? v : best)));
++  }
++
+   const debug = {
+     bytecode: binToHex(scriptToBytecode(optimisationResult.script)),
+     sourceMap: generateSourceMap(optimisationResult.locationData),
+diff --git a/packages/cashc/src/stack-rescheduling.ts b/packages/cashc/src/stack-rescheduling.ts
+index 06cfd1b2..d0cda7ba 100644
+--- a/packages/cashc/src/stack-rescheduling.ts
++++ b/packages/cashc/src/stack-rescheduling.ts
+@@ -94,6 +94,7 @@ export interface RescheduleOptions {
+   mainInArity: number; // spend parameters + constructor parameters
+   objective: 'size' | 'opcost';
+   constructorParamLength: number;
++  crossCallScheduling?: boolean; // see CROSS-CALL SCHEDULING
+ }
+ 
+ export interface RescheduleOutcome {
+@@ -345,7 +346,7 @@ function decompile(script: Script, arities: Map<number, FunctionArity>, inArity:
+ 
+ // ---------- scheduler ----------
+ 
+-type Strategy = 'topo' | 'greedy' | 'opcost' | 'beam';
++type Strategy = 'topo' | 'greedy' | 'opcost' | 'beam' | 'exact' | 'beamx';
+ 
+ const keyOf = (ref: Ref): string | undefined => {
+   if (ref.k === 'in') return `m${ref.i}`;
+@@ -429,13 +430,198 @@ function bringRef(s: EmitState, ref: Ref, consumeContext: boolean, exitNeed: Map
+   }
+ }
+ 
++// CROSS-CALL SCHEDULING (internal option `crossCallScheduling`, set for the duration of one
++// applyStackRescheduling run). An OP_INVOKE is already a single DAG node with a fixed stack
++// effect (arity.in -> arity.out); what the plain scheduler lacks is planning a node's operand
++// placement TOGETHER with where its producers left their results: it always re-fetches every
++// operand, so a callee whose arguments are already sitting on top of the stack in order (the
++// results of the previous call) still pays a full `<d> ROLL` per argument. With cross-call
++// scheduling on:
++//   * operand ADOPTION: the longest run of a node's leading operands that is already on top of
++//     the stack, in order, is consumed in place (zero moves); only the rest is fetched. The
++//     same applies to the block's exit layout.
++//   * commutative two-input prims stage whichever operand order is cheaper.
++//   * node choice uses the EXACT emission cost of computing a candidate next (clone + emit),
++//     so a producer is preferred when its results land where the consumer wants them, and a
++//     wider beam searches over those exact costs.
++let crossCall = false;
++
++const COMMUTATIVE = new Set<number>([
++  Op.OP_ADD, Op.OP_MUL, Op.OP_BOOLAND, Op.OP_BOOLOR, Op.OP_NUMEQUAL, Op.OP_NUMNOTEQUAL,
++  Op.OP_MIN, Op.OP_MAX, Op.OP_AND, Op.OP_OR, Op.OP_XOR, Op.OP_EQUAL,
++]);
++
++// ARGUMENT SYMMETRIES of OP_DEFINE'd functions, PROVEN structurally (see findSymmetries):
++//   half:  f(a, b) == f(b, a) for a = args[0..n/2), b = args[n/2..n) (addFp, mulFp, fp2Add,
++//          fp2Mul (Karatsuba), fp6Mul, fp12Mul, ...)
++//   comps: groups of argument positions any two of which may be exchanged (fp2Add: {0,2},
++//          {1,3}); every proven transposition is a symmetry, and so is any product of them.
++// Set per applyStackRescheduling run.
++interface Symmetry { half: boolean; comps: number[][] }
++let calleeSymmetries: Map<number, Symmetry> = new Map();
++
++// Canonical form of an argument list under a proven symmetry: sort within each component,
++// then take the smaller of that and the same for the half-swapped list. Each result is the
++// image of the input under a proven symmetry, so equal canonical forms imply equal values
++// (the form need not be fully canonical; missing a match only loses a proof).
++function canonicalArgs(ins: string[], sym: Symmetry): string[] {
++  const sortComps = (list: string[]): string[] => {
++    const out = [...list];
++    sym.comps.forEach((comp) => {
++      const values = comp.map((i) => out[i]).sort();
++      comp.forEach((i, k) => { out[i] = values[k]; });
++    });
++    return out;
++  };
++  const a = sortComps(ins);
++  if (!sym.half) return a;
++  const h = ins.length / 2;
++  const b = sortComps([...ins.slice(h), ...ins.slice(0, h)]);
++  return a.join(',') <= b.join(',') ? a : b;
++}
++
++// Structural proof: the callee body must lift to ONE block without control flow, altstack
++// use or dead computation. Its exit values are canonicalised (commutative prims sort their
++// operands, invokes of callees with proven symmetries use canonicalArgs, every distinct
++// subterm is interned in ONE table shared by all passes, so equal ids imply equal terms)
++// once over the identity inputs and once per candidate argument relabelling. Equal
++// canonical exits mean the relabelled call computes identical values.
++function findSymmetries(d: Dissected, arities: Map<number, FunctionArity>): Map<number, Symmetry> {
++  const proven = new Map<number, Symmetry>();
++  calleeFirstOrder(d).forEach((id) => {
++    const arity = arities.get(id);
++    if (arity === undefined || arity.in < 2) return;
++    let items: Item[];
++    try { items = decompile(d.bodies.get(id)!, arities, arity.in); } catch { return; }
++    if (items.length !== 1 || !('block' in items[0])) return;
++    const { block } = items[0];
++    if (block.entryAlt !== 0 || block.exitAlt.length !== 0 || hasDeadComputation(block)) return;
++    const n = arity.in;
++    const intern = new Map<string, number>();
++    const internOf = (str: string): number => {
++      if (!intern.has(str)) intern.set(str, intern.size);
++      return intern.get(str)!;
++    };
++    const canon = (relabel: (i: number) => number): string => {
++      const memo = new Map<number, number>();
++      const refId = (ref: Ref): string => {
++        if (ref.k === 'const') return `k${binToHex(ref.data)}`;
++        if (ref.k === 'in') return `i${relabel(ref.i)}`;
++        if (ref.k === 'ain') return `a${ref.i}`;
++        return `n${nodeId(ref.node)}_${ref.j}`;
++      };
++      const nodeId = (node: DagNode): number => {
++        const cached = memo.get(node.id);
++        if (cached !== undefined) return cached;
++        let ins = node.ins.map(refId);
++        if (node.kind === 'prim' && COMMUTATIVE.has(node.code) && ins.length === 2) ins = [...ins].sort();
++        const sym = node.kind === 'invoke' ? proven.get(node.code) : undefined;
++        if (sym !== undefined) ins = canonicalArgs(ins, sym);
++        const value = internOf(`${node.kind}${node.code}(${ins.join(',')})`);
++        memo.set(node.id, value);
++        return value;
++      };
++      return block.exit.map(refId).join('|');
++    };
++    const reference = canon((i) => i);
++    const half = n % 2 === 0 && canon((i) => (i < n / 2 ? i + n / 2 : i - n / 2)) === reference;
++    // proven transpositions -> connected components (the transpositions of a component
++    // generate the full symmetric group on it)
++    const parent = Array.from({ length: n }, (_, i) => i);
++    const find = (i: number): number => {
++      let r = i;
++      while (parent[r] !== r) r = parent[r];
++      return r;
++    };
++    for (let i = 0; i < n; i += 1) {
++      for (let j = i + 1; j < n; j += 1) {
++        if (find(i) !== find(j) && canon((x) => (x === i ? j : x === j ? i : x)) === reference) {
++          parent[find(j)] = find(i);
++        }
++      }
++    }
++    const groups = new Map<number, number[]>();
++    for (let i = 0; i < n; i += 1) groups.set(find(i), [...(groups.get(find(i)) ?? []), i]);
++    const comps = [...groups.values()].filter((g) => g.length > 1);
++    if (half || comps.length > 0) proven.set(id, { half, comps });
++  });
++  return proven;
++}
++
++// longest k such that the top k stack labels are exactly staged[0..k) and consuming them in
++// place leaves every remaining use of those values satisfiable (another copy stays below)
++function adoptablePrefix(s: EmitState, staged: Ref[], remainingUses: (key: string) => number): number {
++  const len = s.stk.length;
++  for (let k = Math.min(staged.length, len); k > 0; k -= 1) {
++    let match = true;
++    const adopted = new Map<string, number>();
++    for (let i = 0; i < k; i += 1) {
++      const key = keyOf(staged[i]);
++      if (key === undefined || s.stk[len - k + i] !== key) { match = false; break; }
++      adopted.set(key, (adopted.get(key) ?? 0) + 1);
++    }
++    if (!match) continue;
++    const below = s.stk.slice(0, len - k);
++    const ok = [...adopted].every(([key, a]) => remainingUses(key) - a <= 0 || below.includes(key));
++    if (ok) return k;
++  }
++  return 0;
++}
++
++function stageOperands(s: EmitState, staged: Ref[], exitNeed: Map<string, number>): void {
++  let adopted = 0;
++  if (crossCall) {
++    adopted = adoptablePrefix(s, staged, (key) => (s.useCount.get(key) ?? 0) + (exitNeed.get(key) ?? 0));
++    for (let i = 0; i < adopted; i += 1) {
++      const key = keyOf(staged[i])!;
++      s.useCount.set(key, (s.useCount.get(key) ?? 0) - 1);
++    }
++  }
++  staged.slice(adopted).forEach((r) => bringRef(s, r, true, exitNeed));
++}
++
+ // compute one DAG node on top of the stack, staging arguments in the callee's chosen
+ // entry order for permuted OP_INVOKE targets
+ function computeNode(s: EmitState, node: DagNode, exitNeed: Map<string, number>, calleePerms: Map<number, number[]>): void {
+   s.remaining.delete(node.id);
+   const perm = node.kind === 'invoke' ? calleePerms.get(node.code) : undefined;
+-  const staged = perm !== undefined ? perm.map((i) => node.ins[i]) : node.ins;
+-  staged.forEach((r) => bringRef(s, r, true, exitNeed));
++  let staged = perm !== undefined ? perm.map((i) => node.ins[i]) : node.ins;
++  const trial = (order: Ref[]): number => {
++    const t = cloneState(s);
++    stageOperands(t, order, new Map(exitNeed));
++    return t.cost;
++  };
++  if (crossCall && node.kind === 'prim' && COMMUTATIVE.has(node.code) && staged.length === 2) {
++    const swapped = [staged[1], staged[0]];
++    if (trial(swapped) < trial(staged)) staged = swapped;
++  }
++  const sym = crossCall && node.kind === 'invoke' ? calleeSymmetries.get(node.code) : undefined;
++  if (sym !== undefined) {
++    // relabel the LOGICAL arguments under proven symmetries (half swap, then improving
++    // transpositions within components), then apply the callee's entry permutation
++    const stage = (ins: Ref[]): Ref[] => (perm !== undefined ? perm.map((i) => ins[i]) : ins);
++    let bestIns = node.ins;
++    let bestCost = trial(staged);
++    if (sym.half) {
++      const h = node.ins.length / 2;
++      const swappedIns = [...node.ins.slice(h), ...node.ins.slice(0, h)];
++      const cost = trial(stage(swappedIns));
++      if (cost < bestCost) { bestIns = swappedIns; bestCost = cost; }
++    }
++    const transpositions = sym.comps.flatMap((comp) => comp.flatMap((i, a) => comp.slice(a + 1).map((j) => [i, j])));
++    for (let pass = 0; pass < 2; pass += 1) {
++      let improved = false;
++      for (const [i, j] of transpositions) {
++        const candidate = [...bestIns];
++        [candidate[i], candidate[j]] = [candidate[j], candidate[i]];
++        const cost = trial(stage(candidate));
++        if (cost < bestCost) { bestIns = candidate; bestCost = cost; improved = true; }
++      }
++      if (!improved) break;
++    }
++    staged = stage(bestIns);
++  }
++  stageOperands(s, staged, exitNeed);
+   if (node.kind === 'invoke') { pushNum(s, node.code); appendOp(s, Op.OP_INVOKE); } else appendOp(s, node.code);
+   s.stk.length -= node.ins.length;
+   for (let j = 0; j < node.nout; j += 1) s.stk.push(`n${node.id}_${j}`);
+@@ -449,6 +635,8 @@ interface EmitOptions {
+ const NO_PERMS: Map<number, number[]> = new Map();
+ const BEAM_WIDTH = 4;
+ const BEAM_EXPAND = 3;
++const BEAMX_WIDTH = 8;
++const BEAMX_EXPAND = 4;
+ 
+ // Re-emit one block: seed the entry slots, compute the DAG nodes in a strategy-chosen
+ // dependency order (fetching each operand with the cheapest available move/copy), then
+@@ -524,7 +712,17 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+     const desiredKeys = desired.map((r) => (r.k === 'const' ? undefined : keyOf(r)));
+     const inPlace = s.stk.length >= desired.length
+       && desiredKeys.every((dk, i) => dk !== undefined && s.stk[s.stk.length - desired.length + i] === dk);
+-    if (!inPlace) desired.forEach((r) => bringRef(s, r, false, need));
++    if (!inPlace) {
++      let adopted = 0;
++      if (crossCall) {
++        adopted = adoptablePrefix(s, desired, (key) => need.get(key) ?? 0);
++        for (let i = 0; i < adopted; i += 1) {
++          const key = keyOf(desired[i])!;
++          need.set(key, (need.get(key) ?? 0) - 1);
++        }
++      }
++      desired.slice(adopted).forEach((r) => bringRef(s, r, false, need));
++    }
+ 
+     const K = desired.length;
+     const junk = s.stk.length - K;
+@@ -543,13 +741,20 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+     if (!altPass) for (let i = 0; i < exitAlt.length; i += 1) appendOp(s, Op.OP_TOALTSTACK);
+   };
+ 
+-  if (strategy !== 'beam') {
++  // exact incremental cost of computing `nd` next (cross-call scheduling): emit it on a clone
++  const exactCost = (s: EmitState, nd: DagNode): number => {
++    const t = cloneState(s);
++    computeNode(t, nd, new Map(exitNeed), calleePerms);
++    return t.cost - s.cost;
++  };
++
++  if (strategy !== 'beam' && strategy !== 'beamx') {
+     const state = initial;
+     while (state.remaining.size > 0) {
+       const candidates = readyNodes(state);
+       let node = candidates[0];
+       if (strategy !== 'topo') {
+-        const cost = strategy === 'opcost' ? fetchCostOp : fetchCostBytes;
++        const cost = strategy === 'exact' ? exactCost : strategy === 'opcost' ? fetchCostOp : fetchCostBytes;
+         let best = cost(state, candidates[0]);
+         candidates.forEach((candidate) => {
+           const c = cost(state, candidate);
+@@ -565,14 +770,17 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+   // beam search: expand each surviving state by its BEAM_EXPAND cheapest ready nodes,
+   // keep the BEAM_WIDTH cheapest accumulated schedules (all states have computed the
+   // same number of nodes, so accumulated cost is comparable)
++  const exactBeam = strategy === 'beamx';
++  const width = exactBeam ? BEAMX_WIDTH : BEAM_WIDTH;
++  const expand = exactBeam ? BEAMX_EXPAND : BEAM_EXPAND;
+   let beam: EmitState[] = [initial];
+   for (let step = 0; step < order.length; step += 1) {
+     const next: EmitState[] = [];
+     beam.forEach((state) => {
+       const candidates = readyNodes(state)
+-        .map((nd) => ({ nd, c: fetchCostOp(state, nd) }))
++        .map((nd) => ({ nd, c: exactBeam ? exactCost(state, nd) : fetchCostOp(state, nd) }))
+         .sort((a, b) => a.c - b.c)
+-        .slice(0, BEAM_EXPAND);
++        .slice(0, expand);
+       candidates.forEach(({ nd }) => {
+         const branch = cloneState(state);
+         computeNode(branch, nd, exitNeed, calleePerms);
+@@ -580,7 +788,7 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+       });
+     });
+     next.sort((a, b) => a.cost - b.cost);
+-    beam = next.slice(0, BEAM_WIDTH);
++    beam = next.slice(0, width);
+   }
+   let best: Script | undefined;
+   let bestCost = Infinity;
+@@ -953,8 +1161,16 @@ function layoutCandidates(body: Script, arities: Map<number, FunctionArity>, inA
+   const byUseCountAsc = [...identity].sort((a, b) => (useCount[a] - useCount[b]) || (a - b));
+   const reverse = [...identity].reverse();
+ 
++  // cross-call scheduling: half-wise variants, so a two-operand callee can take each
++  // operand reversed (matching a producer's first-last results) in either operand order
++  const extra: number[][] = [];
++  if (crossCall && inArity % 2 === 0 && inArity >= 4) {
++    const h = inArity / 2;
++    const lo = identity.slice(0, h); const hi = identity.slice(h);
++    extra.push([...[...lo].reverse(), ...[...hi].reverse()], [...hi, ...lo]);
++  }
+   const seen = new Set<string>();
+-  return [identity, byFirstUseDesc, byUseCountAsc, reverse].filter((perm) => {
++  return [identity, byFirstUseDesc, byUseCountAsc, reverse, ...extra].filter((perm) => {
+     const key = perm.join(',');
+     if (seen.has(key)) return false;
+     seen.add(key);
+@@ -966,6 +1182,7 @@ function layoutCandidates(body: Script, arities: Map<number, FunctionArity>, inA
+ 
+ const BODY_STRATEGIES: Strategy[] = ['topo', 'greedy', 'opcost'];
+ const MAIN_STRATEGIES: Strategy[] = ['topo', 'greedy', 'opcost'];
++const CROSSCALL_STRATEGIES: Strategy[] = ['exact', 'beamx'];
+ // adopt a non-identity entry layout only if it beats the best identity variant by >1%
+ // (its call-site staging costs are not visible in the body-level measurement)
+ const LAYOUT_HYSTERESIS = 1.01;
+@@ -983,10 +1200,12 @@ interface BodyChoices {
+ // caller falls back to identity layouts wholesale).
+ function rescheduleBodies(
+   d: Dissected, arities: Map<number, FunctionArity>, objective: 'size' | 'opcost', layouts: boolean,
++  mainInArity?: number,
+ ): BodyChoices {
+   const overrides = new Map<number, Script>();
+   const perms = new Map<number, number[]>();
+-  const strategies: Strategy[] = layouts ? [...BODY_STRATEGIES, 'beam'] : BODY_STRATEGIES;
++  const base: Strategy[] = crossCall ? [...BODY_STRATEGIES, ...CROSSCALL_STRATEGIES] : BODY_STRATEGIES;
++  const strategies: Strategy[] = layouts ? [...base, 'beam'] : base;
+   const processing = layouts ? calleeFirstOrder(d) : d.order;
+ 
+   processing.forEach((id) => {
+@@ -1012,8 +1231,47 @@ function rescheduleBodies(
+     }
+ 
+     const candidatesPerms = layouts ? layoutCandidates(original, arities, arity.in) : [undefined];
++    // CALL-SITE-AWARE LAYOUTS (cross-call scheduling): a permuted entry layout changes how
++    // every caller stages its arguments, e.g. cashc pushes a call's arguments last-first while
++    // results come out first-last, so a chained f(g(x)) re-orders the whole tuple unless f
++    // takes its arguments reversed. Rank each layout by body cost PLUS the static cost change
++    // of re-emitting every direct caller (bodies and main) under it; a caller that cannot be
++    // re-emitted rules the layout out.
++    const callSiteDelta = new Map<string, number>();
++    const useCallSites = crossCall && layouts && mainInArity !== undefined && candidatesPerms.length > 1;
++    if (useCallSites) {
++      const callers: Array<{ script: Script; inArity: number }> = [];
++      d.order.forEach((caller) => {
++        const callerArity = arities.get(caller);
++        if (caller !== id && callerArity !== undefined && bodyInvokes(d.bodies.get(caller)!).includes(id)) {
++          callers.push({ script: d.bodies.get(caller)!, inArity: callerArity.in });
++        }
++      });
++      if (bodyInvokes(d.main).includes(id)) callers.push({ script: d.main, inArity: mainInArity! });
++      const callersCost = (calleePerms: Map<number, number[]>): number => callers.reduce((sum, caller) => {
++        let bestCaller = Infinity;
++        (['topo', 'greedy'] as Strategy[]).forEach((strategy) => {
++          try {
++            const out = recompileScript(caller.script, arities, caller.inArity, strategy, objective, { calleePerms }).script;
++            bestCaller = Math.min(bestCaller, scriptCost(out, objective));
++          } catch { /* not re-emittable under this convention */ }
++        });
++        return sum + bestCaller;
++      }, 0);
++      const baseCallers = callersCost(perms);
++      candidatesPerms.forEach((perm) => {
++        if (isIdentityPerm(perm as number[] | undefined)) return;
++        const delta = callersCost(new Map([...perms, [id, perm as number[]]])) - baseCallers;
++        callSiteDelta.set((perm as number[]).join(','), delta);
++      });
++    }
++    // measured op-cost sums 3 runs of the body (measureBody's K); weigh one static
++    // call-site estimate per run
++    const callSiteWeight = objective === 'opcost' ? 3 : 1;
+     candidatesPerms.forEach((perm) => {
+       const identity = isIdentityPerm(perm as number[] | undefined);
++      const siteDelta = identity ? 0 : (callSiteDelta.get((perm as number[]).join(',')) ?? 0);
++      if (!Number.isFinite(siteDelta)) return;
+       strategies.forEach((strategy) => {
+         let candidate: Script;
+         try {
+@@ -1022,7 +1280,8 @@ function rescheduleBodies(
+           }).script);
+         } catch { return; }
+         const cost = bodyCost(candidate, identity ? undefined : (perm as number[]));
+-        const effective = identity ? cost : cost * LAYOUT_HYSTERESIS;
++        const effective = identity ? cost
++          : useCallSites ? cost + callSiteWeight * siteDelta : cost * LAYOUT_HYSTERESIS;
+         const effectivePerm = identity ? undefined : (perm as number[]);
+         if (effective < bestCost && bodyEquiv(d, overrides, id, candidate, arity, effectivePerm)) {
+           best = candidate;
+@@ -1094,6 +1353,28 @@ export function applyStackRescheduling(
+   optimised: OptimiseBytecodeResult,
+   frames: DebugFrame[],
+   options: RescheduleOptions,
++): RescheduleOutcome {
++  const previous = crossCall;
++  const previousSymmetries = calleeSymmetries;
++  crossCall = options.crossCallScheduling ?? false;
++  calleeSymmetries = crossCall
++    ? findSymmetries(dissect(optimised.script), options.arities) : new Map();
++  if (process.env.CASHC_DEBUG_RESCHEDULE !== undefined) {
++    const list = [...calleeSymmetries].map(([id, sym]) => `${id}${sym.half ? 'h' : ''}${sym.comps.map((c) => `{${c.join(',')}}`).join('')}`);
++    console.error(`[reschedule] symmetries: ${list.join(' ')}`); // eslint-disable-line no-console
++  }
++  try {
++    return applyStackReschedulingInner(optimised, frames, options);
++  } finally {
++    crossCall = previous;
++    calleeSymmetries = previousSymmetries;
++  }
++}
++
++function applyStackReschedulingInner(
++  optimised: OptimiseBytecodeResult,
++  frames: DebugFrame[],
++  options: RescheduleOptions,
+ ): RescheduleOutcome {
+   const { arities, objective, constructorParamLength } = options;
+   const d = dissect(optimised.script);
+@@ -1116,7 +1397,7 @@ export function applyStackRescheduling(
+   const layouts = optimised.logs.length === 0 && !allScripts.some(hasAmbiguousInvoke);
+   const debug = process.env.CASHC_DEBUG_RESCHEDULE !== undefined;
+   try {
+-    choices = rescheduleBodies(d, loggableArities, objective, layouts);
++    choices = rescheduleBodies(d, loggableArities, objective, layouts, options.mainInArity);
+     if (debug && layouts) {
+       // eslint-disable-next-line no-console
+       console.error(`[reschedule] layouts: ${choices.perms.size} permuted of ${d.order.length} bodies (${[...choices.perms.keys()].join(',')})`);
+@@ -1140,7 +1421,7 @@ export function applyStackRescheduling(
+     const needsReemit = perms.size > 0 && bodyInvokes(d.main).some((id) => perms.has(id));
+     let best: RecompiledScript | undefined;
+     let bestCost = needsReemit ? Infinity : scriptCost(d.main, objective);
+-    MAIN_STRATEGIES.forEach((strategy) => {
++    (crossCall ? [...MAIN_STRATEGIES, ...CROSSCALL_STRATEGIES] : MAIN_STRATEGIES).forEach((strategy) => {
+       let candidate: RecompiledScript;
+       try {
+         candidate = recompileScript(d.main, arities, options.mainInArity, strategy, objective, { calleePerms: perms });
+diff --git a/packages/cashc/test/stack-rescheduling.test.ts b/packages/cashc/test/stack-rescheduling.test.ts
+index f511686a..5b13c351 100644
+--- a/packages/cashc/test/stack-rescheduling.test.ts
++++ b/packages/cashc/test/stack-rescheduling.test.ts
+@@ -219,3 +219,68 @@ describe('rescheduled output is re-optimised', () => {
+     });
+   });
+ });
++
++// Cross-call scheduling (crossCallScheduling, default on): operand adoption, commutative
++// staging, and half-swap symmetric callees. `addm`/`mul2` are proven symmetric and may get
++// their argument halves swapped at call sites; `subm` is not symmetric and must never be.
++const M = 1000003n;
++const CROSSCALL_CONTRACT = `
++  function addm(int a, int b) returns (int) { return (a + b) % ${M}; }
++  function subm(int a, int b) returns (int) { return (a - b + ${M}) % ${M}; }
++  function mul2(int a0, int a1, int b0, int b1) returns (int, int) {
++    int v0 = (a0 * b0) % ${M};
++    int v1 = (a1 * b1) % ${M};
++    return subm(v0, v1), subm(((a0 + a1) * (b0 + b1)) % ${M}, addm(v0, v1));
++  }
++  function t0Of(int v) returns (int) { return subm(v, 1); }
++  contract CrossCall() {
++    function spend(int x0, int x1, int y0, int y1, int w0, int w1) {
++      (int p0, int p1) = mul2(x0, x1, y0, y1);
++      (int q0, int q1) = mul2(p0, p1, x0, x1);
++      (int r0, int r1) = mul2(y0, y1, q0, q1);
++      int s = subm(r0, q1);
++      int t = subm(addm(p0, t0Of(r1)), y1);
++      require(s == w0);
++      require(t == w1);
++    }
++  }
++`;
++
++const mod = (v: bigint): bigint => ((v % M) + M) % M;
++const mul2 = (a0: bigint, a1: bigint, b0: bigint, b1: bigint): [bigint, bigint] => {
++  const v0 = mod(a0 * b0); const v1 = mod(a1 * b1);
++  return [mod(v0 - v1), mod(mod((a0 + a1) * (b0 + b1)) - mod(v0 + v1))];
++};
++const crossCallExpected = (x0: bigint, x1: bigint, y0: bigint, y1: bigint): [bigint, bigint] => {
++  const [p0, p1] = mul2(x0, x1, y0, y1);
++  const [q0, q1] = mul2(p0, p1, x0, x1);
++  const [r0, r1] = mul2(y0, y1, q0, q1);
++  return [mod(r0 - q1), mod(mod(p0 + mod(r1 - 1n)) - y1)];
++};
++
++describe('cross-call scheduling', () => {
++  it.each([['opcost'], ['size']] as const)(
++    'preserves accept/reject behaviour under the %s objective',
++    (optimizeFor) => {
++      const options = { optimizeFor, rescheduleStacks: true, disableInlining: true };
++      const plain = compileString(CROSSCALL_CONTRACT, { ...options, crossCallScheduling: false } as never);
++      const crossCall = compileString(CROSSCALL_CONTRACT, options);
++      const vectors: bigint[][] = [[3n, 5n, 7n, 11n], [999999n, 123456n, 1n, 0n], [424242n, 77n, 500000n, 1000002n]];
++      vectors.forEach(([x0, x1, y0, y1]) => {
++        const [e0, e1] = crossCallExpected(x0, x1, y0, y1);
++        [plain, crossCall].forEach((artifact) => {
++          expect(evaluate(artifact.bytecode, [x0, x1, y0, y1, e0, e1])).toBe(true);
++          expect(evaluate(artifact.bytecode, [x0, x1, y0, y1, e0, mod(e1 + 1n)])).toBe(false);
++          expect(evaluate(artifact.bytecode, [x0, x1, y0, y1, mod(e0 + 1n), e1])).toBe(false);
++        });
++      });
++    },
++  );
++
++  it('never grows the bytecode on this contract under the size objective', () => {
++    const options = { optimizeFor: 'size', rescheduleStacks: true, disableInlining: true } as const;
++    const plain = compileString(CROSSCALL_CONTRACT, { ...options, crossCallScheduling: false } as never);
++    const crossCall = compileString(CROSSCALL_CONTRACT, options);
++    expect(hexToBin(crossCall.debug!.bytecode).length).toBeLessThanOrEqual(hexToBin(plain.debug!.bytecode).length);
++  });
++});
+diff --git a/packages/cashc/src/block-moves.ts b/packages/cashc/src/block-moves.ts
+new file mode 100644
+index 00000000..5fc78667
+--- /dev/null
++++ b/packages/cashc/src/block-moves.ts
+@@ -0,0 +1,572 @@
++// Block moves: collapse runs of single-item stack fetches that move or copy a CONTIGUOUS
++// block of k stack items into one call of a small looping helper function.
++//
++// Aggregate values (an Fp2 pair, an Fp6 sextuple, an Fp12 of 12 ints) live on the stack as
++// contiguous blocks, and staging one as a call argument compiles to k single-item fetches
++// whose depth operands form an arithmetic progression:
++//
++//   in-order copy      D PICK  D PICK  D PICK ...      (step 0)
++//   in-order move      D ROLL  D ROLL  D ROLL ...      (step 0)
++//   reversed copy      D PICK  D+2 PICK  D+4 PICK ...  (step 2)
++//   reversed move      D ROLL  D+1 ROLL  D+2 ROLL ...  (step 1)
++//
++// Each fetch costs 2 bytes (D <= 16) or 3 bytes (D > 16), so a 12-item move costs 24-36
++// bytes. A helper body that loops the fetch costs ~13 bytes once (OP_DEFINE'd) and 4-5
++// bytes per call site (`<a> <k|end> <id> OP_INVOKE`). Functions share the main stack, so
++// the helper fetches into the caller's stack directly; its two parameters sit on top and
++// every fetched item is tucked beneath them (OP_ROT OP_ROT), which keeps the per-item depth
++// constant (step 0) or advancing by 1/2 (reversed forms). The trade: ~7 more evaluated
++// instructions per moved item (op-cost), for fewer bytes.
++//
++// The rewrite is exact: every run is replaced by a call that performs precisely the same
++// sequence of PICK/ROLL operations on the caller's stack, and the helpers leave nothing
++// else behind. It runs last (after rescheduling and the final bytecode optimisation), on
++// every OP_DEFINE'd body and on the main routine, and keeps debug data in step (indices
++// inside a collapsed run map to the helper call).
++import {
++  DebugFrame,
++  FullLocationData,
++  Op,
++  OpOrData,
++  OptimiseBytecodeResult,
++  RequireStatement,
++  Script,
++  SourceTagEntry,
++  bytecodeToScript,
++  calculateBytesize,
++  decodeInt,
++  encodeInt,
++  generateSourceMap,
++  scriptToBytecode,
++  sourceMapToLocationData,
++} from '@cashscript/utils';
++import { binToHex } from '@bitauth/libauth';
++
++export type BaseKind = 'P0' | 'R0' | 'P2' | 'R1' | 'LP' | 'LR' | 'LM' | 'DB';
++// a helper kind: a base kind, or a base kind specialised to a fixed count (`R1#12`): the
++// count is baked into the body, so its calls push one parameter less
++export type Kind = BaseKind | `${BaseKind}#${number}`;
++
++// helper bodies. Parameters on top of the caller's stack:
++//   P0/R0: [.. a k]   a = D + 2 (depth of the target with the 2 params on top), k = count
++//   P2/R1: [.. end a] a = D + 2, end = a + step * k
++//   LP/LR: [.. list]  list = one byte per fetch, d + 1 (the depth with the list on top)
++//   LM:    [.. list]  mixed PICK/ROLL list, byte = 2 * (d + 1) + (PICK ? 1 : 0)
++//   DB:    [.. a k]   drop the contiguous block of k items whose shallowest is at depth a - 2
++export const HELPER_BODIES: Record<BaseKind, Script> = {
++  P0: [
++    Op.OP_BEGIN, Op.OP_OVER, Op.OP_PICK, Op.OP_ROT, Op.OP_ROT, Op.OP_1SUB, Op.OP_DUP, Op.OP_NOT, Op.OP_UNTIL, Op.OP_2DROP,
++  ],
++  R0: [
++    Op.OP_BEGIN, Op.OP_OVER, Op.OP_ROLL, Op.OP_ROT, Op.OP_ROT, Op.OP_1SUB, Op.OP_DUP, Op.OP_NOT, Op.OP_UNTIL, Op.OP_2DROP,
++  ],
++  P2: [
++    Op.OP_BEGIN, Op.OP_DUP, Op.OP_PICK, Op.OP_ROT, Op.OP_ROT, Op.OP_2, Op.OP_ADD, Op.OP_2DUP, Op.OP_NUMEQUAL, Op.OP_UNTIL,
++    Op.OP_2DROP,
++  ],
++  R1: [
++    Op.OP_BEGIN, Op.OP_DUP, Op.OP_ROLL, Op.OP_ROT, Op.OP_ROT, Op.OP_1ADD, Op.OP_2DUP, Op.OP_NUMEQUAL, Op.OP_UNTIL,
++    Op.OP_2DROP,
++  ],
++  LP: [
++    Op.OP_BEGIN, Op.OP_1, Op.OP_SPLIT, Op.OP_SWAP, Op.OP_PICK, Op.OP_SWAP, Op.OP_SIZE, Op.OP_NOT, Op.OP_UNTIL, Op.OP_DROP,
++  ],
++  LR: [
++    Op.OP_BEGIN, Op.OP_1, Op.OP_SPLIT, Op.OP_SWAP, Op.OP_ROLL, Op.OP_SWAP, Op.OP_SIZE, Op.OP_NOT, Op.OP_UNTIL, Op.OP_DROP,
++  ],
++  LM: [
++    Op.OP_BEGIN, Op.OP_1, Op.OP_SPLIT, Op.OP_SWAP, Op.OP_DUP, Op.OP_2, Op.OP_MOD, Op.OP_SWAP, Op.OP_2, Op.OP_DIV, Op.OP_SWAP,
++    Op.OP_IF, Op.OP_PICK, Op.OP_ELSE, Op.OP_ROLL, Op.OP_ENDIF, Op.OP_SWAP, Op.OP_SIZE, Op.OP_NOT, Op.OP_UNTIL, Op.OP_DROP,
++  ],
++  DB: [Op.OP_BEGIN, Op.OP_OVER, Op.OP_ROLL, Op.OP_DROP, Op.OP_1SUB, Op.OP_DUP, Op.OP_NOT, Op.OP_UNTIL, Op.OP_2DROP],
++};
++const STEP: Record<string, number> = { P0: 0, R0: 0, P2: 2, R1: 1 };
++export const ALL_KINDS: BaseKind[] = ['P0', 'R0', 'P2', 'R1', 'LP', 'LR', 'LM', 'DB'];
++const SPECIALISABLE = new Set<BaseKind>(['P0', 'R0', 'P2', 'R1', 'DB']);
++const baseOf = (kind: Kind): BaseKind => kind.split('#')[0] as BaseKind;
++const fixedCountOf = (kind: Kind): number | undefined => (kind.includes('#') ? Number(kind.split('#')[1]) : undefined);
++
++export interface BlockMoveOptions {
++  // helper kinds the pass may use (default: all; drop LM, or LP/LR/LM, to trade bytes for op-cost)
++  kinds?: Kind[];
++  // add helpers specialised to recurring counts (default true)
++  specialise?: boolean;
++  // renumber OP_DEFINE'd functions (helpers included) by static call count so the most
++  // called ids get 1-byte pushes (ids 0..16)
++  renumber?: boolean;
++}
++
++const elOpcode = (el: OpOrData): number => (typeof el === 'number' ? el : -1);
++
++function constNumOf(el: OpOrData | undefined): number | undefined {
++  if (el === undefined) return undefined;
++  if (el instanceof Uint8Array) return el.length <= 4 ? Number(decodeInt(el)) : undefined;
++  if (el === Op.OP_0) return 0;
++  if (el >= Op.OP_1 && el <= Op.OP_16) return el - (Op.OP_1 - 1);
++  return undefined;
++}
++
++// minimal push of a small non-negative number (OP_0 / OP_1..16 / data)
++const pushOf = (n: number): OpOrData => {
++  if (n === 0) return Op.OP_0;
++  if (n >= 1 && n <= 16) return (Op.OP_1 - 1 + n) as Op;
++  return encodeInt(BigInt(n));
++};
++const sizeOf = (els: OpOrData[]): number => calculateBytesize(els);
++
++// the body of a helper kind; a specialised body first materialises its fixed parameter
++export function helperBody(kind: Kind): Script {
++  const base = baseOf(kind);
++  const k = fixedCountOf(kind);
++  if (k === undefined) return HELPER_BODIES[base];
++  // P0/R0/DB take [.. a k]: push k. P2/R1 take [.. end a]: derive end = a + step * k
++  const prefix: Script = STEP[base] === undefined || STEP[base] === 0
++    ? [pushOf(k)]
++    : [Op.OP_DUP, pushOf(STEP[base] * k), Op.OP_ADD, Op.OP_SWAP];
++  return [...prefix, ...HELPER_BODIES[base]];
++}
++
++// ---------- fetch tokens ----------
++
++// A fetch brings one item to the top: PICK (copy) or ROLL (move) from depth d, measured
++// on the stack as it is when that fetch executes. A drop (`<d> ROLL DROP`, NIP, DROP)
++// removes the item at depth d instead.
++interface Fetch { pick: boolean; d: number; drop?: boolean }
++// a token is one or two script elements that perform a fixed sequence of fetches
++interface Token { start: number; end: number; fetches: Fetch[]; bytes: number }
++
++const FIXED: Map<number, Fetch[]> = new Map([
++  [Op.OP_DUP, [{ pick: true, d: 0 }]],
++  [Op.OP_OVER, [{ pick: true, d: 1 }]],
++  [Op.OP_SWAP, [{ pick: false, d: 1 }]],
++  [Op.OP_ROT, [{ pick: false, d: 2 }]],
++  [Op.OP_2DUP, [{ pick: true, d: 1 }, { pick: true, d: 1 }]],
++  [Op.OP_3DUP, [{ pick: true, d: 2 }, { pick: true, d: 2 }, { pick: true, d: 2 }]],
++  [Op.OP_2OVER, [{ pick: true, d: 3 }, { pick: true, d: 3 }]],
++  [Op.OP_2SWAP, [{ pick: false, d: 3 }, { pick: false, d: 3 }]],
++  [Op.OP_2ROT, [{ pick: false, d: 5 }, { pick: false, d: 5 }]],
++  [Op.OP_TUCK, [{ pick: false, d: 1 }, { pick: true, d: 1 }]],
++  [Op.OP_DROP, [{ pick: false, d: 0, drop: true }]],
++  [Op.OP_NIP, [{ pick: false, d: 1, drop: true }]],
++  [Op.OP_2DROP, [{ pick: false, d: 0, drop: true }, { pick: false, d: 0, drop: true }]],
++]);
++
++// maximal segments of consecutive fetch tokens
++function tokenSegments(script: Script): Token[][] {
++  const segments: Token[][] = [];
++  let current: Token[] = [];
++  const flush = (): void => { if (current.length > 0) segments.push(current); current = []; };
++  for (let i = 0; i < script.length;) {
++    const d = constNumOf(script[i]);
++    const next = i + 1 < script.length ? elOpcode(script[i + 1]) : -1;
++    // `TOALTSTACK x m, (DROP|2DROP)..., FROMALTSTACK x m` drops a block of items under the top m
++    if (elOpcode(script[i]) === Op.OP_TOALTSTACK) {
++      let m = 0;
++      while (elOpcode(script[i + m]) === Op.OP_TOALTSTACK) m += 1;
++      let j = i + m;
++      let dropped = 0;
++      while (elOpcode(script[j]) === Op.OP_DROP || elOpcode(script[j]) === Op.OP_2DROP) {
++        dropped += elOpcode(script[j]) === Op.OP_DROP ? 1 : 2; j += 1;
++      }
++      let f = 0;
++      while (f < m && elOpcode(script[j + f]) === Op.OP_FROMALTSTACK) f += 1;
++      if (dropped > 0 && f === m) {
++        const fetches = Array.from({ length: dropped }, () => ({ pick: false, d: m, drop: true }));
++        current.push({ start: i, end: j + m, fetches, bytes: sizeOf(script.slice(i, j + m)) });
++        i = j + m; continue;
++      }
++    }
++    if (d !== undefined && next === Op.OP_ROLL && elOpcode(script[i + 2] ?? Op.OP_NOP) === Op.OP_DROP) {
++      const fetches = [{ pick: false, d, drop: true }];
++      current.push({ start: i, end: i + 3, fetches, bytes: sizeOf(script.slice(i, i + 3)) });
++      i += 3; continue;
++    }
++    if (d !== undefined && (next === Op.OP_PICK || next === Op.OP_ROLL)) {
++      const fetches = [{ pick: next === Op.OP_PICK, d }];
++      current.push({ start: i, end: i + 2, fetches, bytes: sizeOf(script.slice(i, i + 2)) });
++      i += 2; continue;
++    }
++    const fixed = FIXED.get(elOpcode(script[i]));
++    if (fixed !== undefined) {
++      current.push({ start: i, end: i + 1, fetches: fixed, bytes: 1 });
++      i += 1; continue;
++    }
++    flush(); i += 1;
++  }
++  flush();
++  return segments;
++}
++
++// the helper call that performs exactly `fetches` with helper `kind`, if it can
++function encodeCall(kind: Kind, fetches: Fetch[], id: number): Script | undefined {
++  const k = fixedCountOf(kind);
++  const call = encodeBaseCall(baseOf(kind), fetches, id);
++  if (k === undefined || call === undefined) return call;
++  if (fetches.length !== k) return undefined;
++  // drop the parameter the specialised body materialises itself (P0/R0/DB: the count,
++  // pushed second; P2/R1: the end, pushed first)
++  return STEP[baseOf(kind)] === undefined || STEP[baseOf(kind)] === 0 ? [call[0], ...call.slice(2)] : call.slice(1);
++}
++
++function encodeBaseCall(kind: BaseKind, fetches: Fetch[], id: number): Script | undefined {
++  const k = fetches.length;
++  if (k === 0) return undefined;
++  const first = fetches[0];
++  if (kind === 'DB') {
++    // a contiguous block: constant depth (shallowest first) or depth decreasing by one
++    // (deepest first) both remove original depths [min .. min + k - 1]
++    if (!fetches.every((f) => f.drop)) return undefined;
++    const constant = fetches.every((f) => f.d === first.d);
++    const descending = fetches.every((f, j) => f.d === first.d - j);
++    if (!constant && !descending) return undefined;
++    const shallowest = constant ? first.d : first.d - (k - 1);
++    return [pushOf(shallowest + 2), pushOf(k), pushOf(id), Op.OP_INVOKE];
++  }
++  if (fetches.some((f) => f.drop)) return undefined;
++  if (kind === 'LP' || kind === 'LR' || kind === 'LM') {
++    if (kind !== 'LM' && fetches.some((f) => f.pick !== (kind === 'LP'))) return undefined;
++    const bytes = fetches.map((f) => (kind === 'LM' ? 2 * (f.d + 1) + (f.pick ? 1 : 0) : f.d + 1));
++    // each byte is read as a script number: 1..127 are minimal and positive
++    if (bytes.some((b) => b < 1 || b > 127)) return undefined;
++    return [Uint8Array.from(bytes), pushOf(id), Op.OP_INVOKE];
++  }
++  const pick = kind[0] === 'P';
++  const step = STEP[kind];
++  if (!fetches.every((f, j) => f.pick === pick && f.d === first.d + j * step)) return undefined;
++  const a = first.d + 2;
++  return step === 0
++    ? [pushOf(a), pushOf(k), pushOf(id), Op.OP_INVOKE]
++    : [pushOf(a + step * k), pushOf(a), pushOf(id), Op.OP_INVOKE];
++}
++
++interface Replacement { start: number; end: number; with: Script; kind: Kind; count: number }
++
++// longest fetch sequence one helper call may cover (bounds the planner's work)
++const MAX_CALL_FETCHES = 48;
++// helper ids are only fixed by the final renumbering: plan with 2-byte id pushes
++const ID_BYTES = 2;
++
++// does fetch `cur` extend (towards the front) a sequence helper `kind` can perform, given
++// the fetch that follows it (`next`, undefined when cur is the last one)?
++function fits(kind: BaseKind, cur: Fetch, next: Fetch | undefined): boolean {
++  if (kind === 'DB') return cur.drop === true;
++  if (cur.drop) return false;
++  if (kind === 'LM') return 2 * (cur.d + 1) + 1 <= 127;
++  if (kind === 'LP' || kind === 'LR') return cur.pick === (kind === 'LP') && cur.d + 1 <= 127;
++  return cur.pick === (kind[0] === 'P') && (next === undefined || next.d === cur.d + STEP[kind]);
++}
++
++// estimated call size of `kind` for `count` fetches whose first fetch is `first`
++function callSize(kind: Kind, first: Fetch, count: number): number {
++  const base = baseOf(kind);
++  if (fixedCountOf(kind) !== undefined) return sizeOf([pushOf(first.d + 2)]) + ID_BYTES + 1;
++  if (base === 'DB') return 4;
++  if (base === 'LP' || base === 'LR' || base === 'LM') return sizeOf([new Uint8Array(count)]) + ID_BYTES + 1;
++  const a = first.d + 2;
++  const second = STEP[base] === 0 ? count : a + STEP[base] * count;
++  return sizeOf([pushOf(a), pushOf(second)]) + ID_BYTES + 1;
++}
++
++interface Choice { from: number; call?: Script; kind?: Kind; count?: number }
++
++// optimal (min-bytes) cover of a segment by raw tokens and helper calls (dynamic
++// programming over token boundaries; a call covers whole tokens)
++function planSegment(seg: Token[], kinds: Kind[], ids: Record<string, number>): { reps: Replacement[]; saved: number } {
++  const n = seg.length;
++  const cost = new Array<number>(n + 1).fill(Infinity);
++  const choice: Choice[] = new Array(n + 1);
++  cost[0] = 0;
++  for (let j = 1; j <= n; j += 1) {
++    cost[j] = cost[j - 1] + seg[j - 1].bytes;
++    choice[j] = { from: j - 1 };
++    // extend the covered range back one token at a time, tracking per kind whether the
++    // fetches of tokens i..j-1 still fit it
++    const ok = kinds.map(() => true);
++    let dbConst = true;
++    let dbDesc = true;
++    let count = 0;
++    let front: Fetch | undefined;
++    for (let i = j - 1; i >= 0 && count <= MAX_CALL_FETCHES; i -= 1) {
++      for (let f = seg[i].fetches.length - 1; f >= 0; f -= 1) {
++        const cur = seg[i].fetches[f];
++        for (let q = 0; q < kinds.length; q += 1) if (ok[q] && !fits(baseOf(kinds[q]), cur, front)) ok[q] = false;
++        if (front !== undefined && front.d !== cur.d) dbConst = false;
++        if (front !== undefined && front.d !== cur.d - 1) dbDesc = false;
++        front = cur;
++        count += 1;
++      }
++      if (count >= 2 && count <= MAX_CALL_FETCHES && front !== undefined) {
++        for (let q = 0; q < kinds.length; q += 1) {
++          const kind = kinds[q];
++          const fixed = fixedCountOf(kind);
++          const skip = !ok[q] || (fixed !== undefined && fixed !== count)
++            || (baseOf(kind) === 'DB' && !dbConst && !dbDesc);
++          if (!skip && cost[i] + callSize(kind, front, count) < cost[j]) {
++            const call = encodeCall(kind, seg.slice(i, j).flatMap((t) => t.fetches), ids[kind]);
++            if (call !== undefined && cost[i] + sizeOf(call) < cost[j]) {
++              cost[j] = cost[i] + sizeOf(call);
++              choice[j] = { from: i, call, kind, count };
++            }
++          }
++        }
++      }
++    }
++  }
++  const reps: Replacement[] = [];
++  for (let j = n; j > 0;) {
++    const ch = choice[j];
++    if (ch.call !== undefined) {
++      reps.push({ start: seg[ch.from].start, end: seg[j - 1].end, with: ch.call, kind: ch.kind!, count: ch.count! });
++    }
++    j = ch.from;
++  }
++  const raw = seg.reduce((sum, t) => sum + t.bytes, 0);
++  return { reps, saved: raw - cost[n] };
++}
++
++interface Plan { reps: Replacement[]; bytes: number }
++
++function planScript(segments: Token[][], kinds: Kind[], ids: Record<string, number>): Plan {
++  const reps: Replacement[] = [];
++  let saved = 0;
++  segments.forEach((seg) => {
++    const plan = planSegment(seg, kinds, ids);
++    plan.reps.forEach((rep) => reps.push(rep));
++    saved += plan.saved;
++  });
++  reps.sort((x, y) => x.start - y.start);
++  return { reps, bytes: saved };
++}
++
++interface Rewritten { script: Script; remap: (i: number) => number; changed: boolean }
++
++function applyReplacements(script: Script, reps: Replacement[]): Rewritten {
++  const out: Script = [];
++  const starts: { oldStart: number; oldEnd: number; newStart: number; newLen: number }[] = [];
++  let r = 0;
++  for (let i = 0; i < script.length;) {
++    if (r < reps.length && reps[r].start === i) {
++      starts.push({ oldStart: i, oldEnd: reps[r].end, newStart: out.length, newLen: reps[r].with.length });
++      reps[r].with.forEach((el) => out.push(el));
++      i = reps[r].end; r += 1;
++    } else { out.push(script[i]); i += 1; }
++  }
++  const remap = (oldIndex: number): number => {
++    let shift = 0;
++    for (const s of starts) {
++      if (oldIndex < s.oldStart) break;
++      if (oldIndex < s.oldEnd) return s.newStart + Math.min(oldIndex - s.oldStart, s.newLen - 1);
++      shift = s.newStart + s.newLen - s.oldEnd;
++    }
++    return oldIndex + shift;
++  };
++  return { script: out, remap, changed: reps.length > 0 };
++}
++
++export function applyBlockMoves(
++  result: OptimiseBytecodeResult,
++  frames: DebugFrame[],
++  constructorParamLength: number,
++  options: BlockMoveOptions = {},
++): { result: OptimiseBytecodeResult; frames: DebugFrame[] } {
++  const allowed: Kind[] = options.kinds ?? ALL_KINDS;
++  // console.log bookkeeping is per-instruction; leave logged contracts untouched
++  if (result.logs.length > 0) return { result, frames };
++
++  // dissect the OP_DEFINE table prefix
++  const script = result.script;
++  const table: { body: Script; idEl: OpOrData; id: number; index: number }[] = [];
++  let i = 0;
++  while (i + 2 < script.length && script[i] instanceof Uint8Array && elOpcode(script[i + 2]) === Op.OP_DEFINE) {
++    const id = constNumOf(script[i + 1]);
++    if (id === undefined) break;
++    table.push({ body: bytecodeToScript(script[i] as Uint8Array), idEl: script[i + 1], id, index: i });
++    i += 3;
++  }
++  const tableLength = i;
++  const main = script.slice(tableLength);
++  // the main routine must not define functions itself (ids would be ambiguous)
++  if (main.some((el) => elOpcode(el) === Op.OP_DEFINE)) return { result, frames };
++  const usedIds = new Set(table.map((t) => t.id));
++  let nextFree = 0;
++  const helperId: Record<string, number> = {};
++  const assignId = (kind: Kind): void => {
++    if (helperId[kind] !== undefined) return;
++    while (usedIds.has(nextFree)) nextFree += 1;
++    helperId[kind] = nextFree;
++    usedIds.add(nextFree);
++  };
++  allowed.forEach(assignId);
++  const allSegments = [...table.map((t) => t.body), main].map(tokenSegments);
++
++  // choose the helper set: start from all candidate kinds, greedily drop a helper while that
++  // does not lower the net saving (call-site savings minus the helper definitions)
++  const defineCost = (kind: Kind): number => (
++    sizeOf([scriptToBytecode(helperBody(kind)), pushOf(helperId[kind]), Op.OP_DEFINE])
++  );
++  const netSaving = (kinds: Kind[]): number => (
++    allSegments.reduce((sum, segs) => sum + planScript(segs, kinds, helperId).bytes, 0)
++    - kinds.reduce((sum, kind) => sum + defineCost(kind), 0)
++  );
++  const select = (candidates: Kind[]): { kinds: Kind[]; net: number } => {
++    let kinds = [...candidates];
++    let net = netSaving(kinds);
++    for (let improved = true; improved && kinds.length > 0;) {
++      improved = false;
++      for (const kind of kinds) {
++        const trial = kinds.filter((x) => x !== kind);
++        const trialNet = netSaving(trial);
++        if (trialNet >= net) { net = trialNet; kinds = trial; improved = true; break; }
++      }
++    }
++    return { kinds, net };
++  };
++  let { kinds: enabledKinds, net: bestNet } = select(allowed);
++  // specialise the counts that recur (e.g. every Fp12 block move of 12 items)
++  if (options.specialise !== false && enabledKinds.length > 0) {
++    const counts = new Map<string, number>();
++    allSegments.forEach((segs) => planScript(segs, enabledKinds, helperId).reps.forEach((rep) => {
++      if (!SPECIALISABLE.has(baseOf(rep.kind))) return;
++      const key = `${baseOf(rep.kind)}#${rep.count}`;
++      counts.set(key, (counts.get(key) ?? 0) + 1);
++    }));
++    const specials = [...counts.entries()].filter(([, c]) => c >= 3).map(([key]) => key as Kind);
++    if (specials.length > 0) {
++      specials.forEach(assignId);
++      const second = select([...enabledKinds, ...specials]);
++      if (second.net > bestNet) ({ kinds: enabledKinds, net: bestNet } = second);
++    }
++  }
++  if (enabledKinds.length === 0 || bestNet <= 0) return { result, frames };
++
++  const rewrite = (s: Script): Rewritten => (
++    applyReplacements(s, planScript(tokenSegments(s), enabledKinds, helperId).reps)
++  );
++
++  // bodies
++  const newBodies = table.map((t) => rewrite(t.body));
++  const mainRw = rewrite(main);
++
++  // rebuild: original table (rewritten bodies), helper defines, main
++  const out: Script = [];
++  const locationData: FullLocationData = [];
++  const firstLoc = result.locationData[0];
++  table.forEach((t, idx) => {
++    out.push(scriptToBytecode(newBodies[idx].script), t.idEl, Op.OP_DEFINE);
++    for (let k = 0; k < 3; k += 1) locationData.push(result.locationData[t.index + k]);
++  });
++  const helperKinds = enabledKinds;
++  helperKinds.forEach((kind) => {
++    out.push(scriptToBytecode(helperBody(kind)), pushOf(helperId[kind]), Op.OP_DEFINE);
++    for (let k = 0; k < 3; k += 1) locationData.push(result.locationData[tableLength - 1] ?? firstLoc);
++  });
++  const extra = 3 * helperKinds.length;
++  mainRw.script.forEach((el) => out.push(el));
++  // main location data: each new element takes the location of the old element it maps from
++  const mainLoc: FullLocationData = new Array(mainRw.script.length);
++  for (let old = 0; old < main.length; old += 1) {
++    const n = mainRw.remap(old);
++    if (mainLoc[n] === undefined) mainLoc[n] = result.locationData[tableLength + old];
++  }
++  for (let n = 0; n < mainLoc.length; n += 1) mainLoc[n] ??= mainLoc[n - 1] ?? firstLoc;
++  mainLoc.forEach((loc) => locationData.push(loc));
++
++  const remapTop = (oldIndex: number): number => (
++    oldIndex < tableLength ? oldIndex : tableLength + extra + mainRw.remap(oldIndex - tableLength)
++  );
++  const requires = result.requires.map((req: RequireStatement) => ({
++    ...req, ip: remapTop(req.ip - constructorParamLength) + constructorParamLength,
++  }));
++  const sourceTags = result.sourceTags.map((tag: SourceTagEntry) => ({
++    ...tag, startIndex: remapTop(tag.startIndex), endIndex: remapTop(tag.endIndex),
++  }));
++  const inlineRanges = (mainRw.changed || extra > 0) ? [] : result.inlineRanges;
++
++  // frames of rewritten bodies: remap their source maps and require ips
++  const newFrames = frames.map((frame) => {
++    const idx = table.findIndex((t) => binToHex(scriptToBytecode(t.body)) === frame.bytecode);
++    if (idx < 0 || !newBodies[idx].changed) return frame;
++    const rw = newBodies[idx];
++    const oldLoc = sourceMapToLocationData(frame.sourceMap);
++    const loc: FullLocationData = new Array(rw.script.length);
++    for (let old = 0; old < oldLoc.length; old += 1) {
++      const n = rw.remap(old);
++      if (n < loc.length && loc[n] === undefined) loc[n] = oldLoc[old];
++    }
++    for (let n = 0; n < loc.length; n += 1) loc[n] ??= loc[n - 1] ?? oldLoc[0];
++    return {
++      ...frame,
++      bytecode: binToHex(scriptToBytecode(rw.script)),
++      sourceMap: generateSourceMap(loc),
++      requires: frame.requires.map((req) => ({ ...req, ip: rw.remap(req.ip) })),
++      logs: frame.logs.map((log) => ({ ...log, ip: rw.remap(log.ip) })),
++      ...(frame.sourceTags !== undefined ? { sourceTags: undefined } : {}),
++      ...(frame.inlineRanges !== undefined ? { inlineRanges: undefined } : {}),
++    };
++  });
++
++  return {
++    result: {
++      ...result, script: out, locationData, requires, sourceTags, inlineRanges,
++    },
++    frames: newFrames,
++  };
++}
++
++// Renumber the OP_DEFINE'd functions by static call count (most-called first), so the
++// hottest call sites push their id with a 1-byte opcode (ids 0..16). Only element
++// contents change (never element counts), so source maps and debug ips stay valid. Skipped
++// when any OP_INVOKE does not take its id from an immediately preceding constant push, or
++// when the main routine defines functions itself.
++export function renumberFunctions(
++  result: OptimiseBytecodeResult,
++  frames: DebugFrame[],
++): { result: OptimiseBytecodeResult; frames: DebugFrame[] } {
++  const script = result.script;
++  const table: { body: Script; id: number; index: number }[] = [];
++  let i = 0;
++  while (i + 2 < script.length && script[i] instanceof Uint8Array && elOpcode(script[i + 2]) === Op.OP_DEFINE) {
++    const id = constNumOf(script[i + 1]);
++    if (id === undefined) break;
++    table.push({ body: bytecodeToScript(script[i] as Uint8Array), id, index: i });
++    i += 3;
++  }
++  const main = script.slice(i);
++  if (table.length === 0 || main.some((el) => elOpcode(el) === Op.OP_DEFINE)) return { result, frames };
++  const known = new Set(table.map((t) => t.id));
++  const counts = new Map<number, number>(table.map((t) => [t.id, 0]));
++  const allScripts = [...table.map((t) => t.body), main];
++  for (const s of allScripts) {
++    for (let j = 0; j < s.length; j += 1) {
++      if (elOpcode(s[j]) !== Op.OP_INVOKE) continue;
++      const id = j > 0 ? constNumOf(s[j - 1]) : undefined;
++      if (id === undefined || !known.has(id)) return { result, frames };
++      counts.set(id, counts.get(id)! + 1);
++    }
++  }
++  const order = [...table.map((t) => t.id)].sort((a, b) => (counts.get(b)! - counts.get(a)!) || (a - b));
++  const newId = new Map(order.map((id, idx) => [id, idx]));
++  const renumber = (s: Script): Script => s.map((el, j) => (
++    j + 1 < s.length && elOpcode(s[j + 1]) === Op.OP_INVOKE ? pushOf(newId.get(constNumOf(el)!)!) : el
++  ));
++  const out: Script = [...script];
++  const bodyHex = new Map<string, { hex: string; id: number }>();
++  table.forEach((t) => {
++    const body = scriptToBytecode(renumber(t.body));
++    bodyHex.set(binToHex(script[t.index] as Uint8Array), { hex: binToHex(body), id: newId.get(t.id)! });
++    out[t.index] = body;
++    out[t.index + 1] = pushOf(newId.get(t.id)!);
++  });
++  renumber(main).forEach((el, j) => { out[i + j] = el; });
++  const newFrames = frames.map((frame) => {
++    if (frame.id === undefined) return frame;
++    const entry = bodyHex.get(frame.bytecode);
++    const id = newId.get(frame.id);
++    return {
++      ...frame,
++      ...(id !== undefined ? { id } : {}),
++      ...(entry !== undefined ? { bytecode: entry.hex } : {}),
++    };
++  });
++  return { result: { ...result, script: out }, frames: newFrames };
++}
+diff --git a/packages/cashc/test/block-moves.test.ts b/packages/cashc/test/block-moves.test.ts
+new file mode 100644
+index 00000000..6dbbbdad
+--- /dev/null
++++ b/packages/cashc/test/block-moves.test.ts
+@@ -0,0 +1,197 @@
++import {
++  createTestAuthenticationProgramBch,
++  createVirtualMachineBch2026,
++  hexToBin,
++} from '@bitauth/libauth';
++import {
++  bytecodeToScript, encodeInt, Op, OpOrData, OptimiseBytecodeResult, PositionHint, Script, scriptToBytecode,
++} from '@cashscript/utils';
++import {
++  ALL_KINDS, applyBlockMoves, HELPER_BODIES, renumberFunctions,
++} from '../src/block-moves.js';
++import { compileStringInternal } from '../src/compiler.js';
++
++const vm = createVirtualMachineBch2026(false);
++
++// run a script over one padding item (it buys op-cost budget and sits below everything the
++// program touches); returns the final main stack as hex (or the error)
++const PADDING = scriptToBytecode([new Uint8Array(9000)]);
++function run(script: Script): string {
++  const state = vm.evaluate(createTestAuthenticationProgramBch({
++    lockingBytecode: scriptToBytecode(script),
++    unlockingBytecode: PADDING,
++    valueSatoshis: 1000n,
++  }));
++  const stack = state.stack.slice(1).map((item: Uint8Array) => Buffer.from(item).toString('hex')).join(',');
++  const alt = state.alternateStack.length;
++  // the clean-stack / single-item checks are expected to fail for these raw stack programs
++  const benign = state.error === undefined || /clean stack|exactly one|single|Non-P2SH/i.test(String(state.error));
++  return benign ? `${stack}|alt${alt}` : `error: ${state.error}`;
++}
++
++const loc = { location: { start: { line: 1, column: 0 }, end: { line: 1, column: 1 } }, positionHint: PositionHint.START };
++const pushN = (n: number): OpOrData => (n === 0 ? Op.OP_0 : n <= 16 ? (Op.OP_1 - 1 + n) as Op : encodeInt(BigInt(n)));
++
++// deterministic PRNG
++const prng = (seed: number): ((n: number) => number) => {
++  let x = seed;
++  return (n: number): number => { x = (x * 1103515245 + 12345) % 2147483648; return x % n; };
++};
++
++// a random straight-line program over a stack of distinct items: runs of in-order /
++// reversed copies and moves of contiguous blocks, scattered fetches, drops and
++// altstack-drop sequences, with a dummy defined function in the table
++function randomProgram(seed: number): Script {
++  const rnd = prng(seed);
++  const script: Script = [Uint8Array.of(Op.OP_1ADD), Op.OP_0, Op.OP_DEFINE];
++  let depth = 40;
++  for (let i = 0; i < depth; i += 1) script.push(encodeInt(BigInt(1000 + i)));
++  for (let step = 0; step < 30; step += 1) {
++    const kindPick = rnd(8);
++    const k = 2 + rnd(10);
++    if (kindPick <= 1) {
++      // in-order block copy / move
++      const op = kindPick === 0 ? Op.OP_PICK : Op.OP_ROLL;
++      const d = k - 1 + rnd(Math.max(1, depth - k));
++      if (d >= depth) continue;
++      for (let j = 0; j < k; j += 1) script.push(pushN(d), op);
++      if (op === Op.OP_PICK) depth += k;
++    } else if (kindPick === 2) {
++      // reversed copy: D, D+2, ...
++      const d = rnd(Math.max(1, depth - k));
++      if (d + k - 1 >= depth) continue;
++      for (let j = 0; j < k; j += 1) script.push(pushN(d + 2 * j), Op.OP_PICK);
++      depth += k;
++    } else if (kindPick === 3) {
++      // reversed move: D, D+1, ...
++      const d = rnd(Math.max(1, depth - k));
++      if (d + k - 1 >= depth) continue;
++      for (let j = 0; j < k; j += 1) script.push(pushN(d + j), Op.OP_ROLL);
++    } else if (kindPick === 4) {
++      // scattered fetches (list helpers), mixed pick/roll
++      for (let j = 0; j < k; j += 1) {
++        const pick = rnd(2) === 0;
++        script.push(pushN(rnd(depth)), pick ? Op.OP_PICK : Op.OP_ROLL);
++        if (pick) depth += 1;
++      }
++    } else if (kindPick === 5 && depth > 20) {
++      // drop a contiguous block (constant or descending depths)
++      const d = rnd(8);
++      const n = 2 + rnd(5);
++      const descending = rnd(2) === 0;
++      for (let j = 0; j < n; j += 1) script.push(pushN(descending ? d + n - 1 - j : d), Op.OP_ROLL, Op.OP_DROP);
++      depth -= n;
++    } else if (kindPick === 6 && depth > 20) {
++      const m = 1 + rnd(6);
++      const n = 1 + rnd(6);
++      for (let j = 0; j < m; j += 1) script.push(Op.OP_TOALTSTACK);
++      for (let j = 0; j < n; j += 1) script.push(Op.OP_DROP);
++      for (let j = 0; j < m; j += 1) script.push(Op.OP_FROMALTSTACK);
++      depth -= n;
++    } else {
++      const ops = [
++        Op.OP_SWAP, Op.OP_ROT, Op.OP_2SWAP, Op.OP_2ROT, Op.OP_OVER, Op.OP_DUP, Op.OP_2DUP, Op.OP_2OVER, Op.OP_TUCK,
++        Op.OP_3DUP,
++      ];
++      const grow = [0, 0, 0, 0, 1, 1, 2, 2, 1, 3];
++      const o = rnd(ops.length);
++      script.push(ops[o]);
++      depth += grow[o];
++      // keep the defined function in use
++      script.push(Op.OP_0, Op.OP_INVOKE);
++    }
++  }
++  return script;
++}
++
++describe('block moves (blockMoves)', () => {
++  const KIND_SETS = [ALL_KINDS, ...ALL_KINDS.map((kind) => [kind])];
++  const asResult = (script: Script): OptimiseBytecodeResult => ({
++    script, locationData: script.map(() => loc), logs: [], requires: [], sourceTags: [], inlineRanges: [],
++  });
++
++  it.each(Array.from({ length: 40 }, (_, i) => [i]))('preserves the stack effect of random fetch programs (seed %i)', (seed) => {
++    const script = randomProgram(seed + 1);
++    const before = run(script);
++    expect(before).not.toMatch(/^error/);
++    KIND_SETS.forEach((kinds) => {
++      const moved = applyBlockMoves(asResult(script), [], 0, { kinds });
++      const renumbered = renumberFunctions(moved.result, moved.frames);
++      expect(run(moved.result.script)).toEqual(before);
++      expect(run(renumbered.result.script)).toEqual(before);
++      expect(moved.result.locationData.length).toEqual(moved.result.script.length);
++    });
++  });
++
++  it.each(ALL_KINDS.map((kind) => [kind]))('uses the %s helper on some random program', (kind) => {
++    const body = Buffer.from(scriptToBytecode(HELPER_BODIES[kind])).toString('hex');
++    const used = Array.from({ length: 80 }, (_, i) => randomProgram(i + 1)).some((script) => (
++      Buffer.from(scriptToBytecode(applyBlockMoves(asResult(script), [], 0, { kinds: [kind] }).result.script))
++        .toString('hex').includes(body)
++    ));
++    expect(used).toBe(true);
++  });
++
++  it('shrinks the random programs', () => {
++    const script = randomProgram(7);
++    const result = {
++      script, locationData: script.map(() => loc), logs: [], requires: [], sourceTags: [], inlineRanges: [],
++    };
++    const moved = applyBlockMoves(result, [], 0, { kinds: ALL_KINDS });
++    expect(scriptToBytecode(moved.result.script).length).toBeLessThan(scriptToBytecode(script).length);
++  });
++
++  // aggregate-style contract: 12-int arguments copied and consumed as blocks
++  const CONTRACT = `
++    function add6(int a0, int a1, int a2, int a3, int a4, int a5, int b0, int b1, int b2, int b3, int b4, int b5)
++      returns (int, int, int, int, int, int) {
++      return (a0 + b0) % 1000003, (a1 + b1) % 1000003, (a2 + b2) % 1000003,
++        (a3 + b3) % 1000003, (a4 + b4) % 1000003, (a5 + b5) % 1000003;
++    }
++    function mul12(int a0, int a1, int a2, int a3, int a4, int a5, int a6, int a7, int a8, int a9, int a10, int a11,
++      int b0, int b1, int b2, int b3, int b4, int b5, int b6, int b7, int b8, int b9, int b10, int b11)
++      returns (int, int, int, int, int, int, int, int, int, int, int, int) {
++      (int c0, int c1, int c2, int c3, int c4, int c5) = add6(a0, a1, a2, a3, a4, a5, b0, b1, b2, b3, b4, b5);
++      (int d0, int d1, int d2, int d3, int d4, int d5) = add6(a6, a7, a8, a9, a10, a11, b6, b7, b8, b9, b10, b11);
++      (int g0, int g1, int g2, int g3, int g4, int g5) = add6(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
++      (int f0, int f1, int f2, int f3, int f4, int f5) = add6(c0, c1, c2, c3, c4, c5, g0, g1, g2, g3, g4, g5);
++      return f0, f1, f2, f3, f4, f5, d0, d1, d2, d3, d4, d5;
++    }
++    contract Agg() {
++      function spend(int x, int y) {
++        int f0 = x; int f1 = y; int f2 = 3; int f3 = 4; int f4 = 5; int f5 = 6;
++        int f6 = 7; int f7 = 8; int f8 = 9; int f9 = 10; int f10 = 11; int f11 = 12;
++        for (int i = 0; i < 3; i = i + 1) {
++          (f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11) =
++            mul12(f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f11, f10, f9, f8, f7, f6, f5, f4, f3, f2, f1, f0);
++        }
++        require(f0 + f1 + f2 + f3 + f4 + f5 + f6 + f7 + f8 + f9 + f10 + f11 != 77);
++      }
++    }`;
++
++  const evaluate = (bytecode: string, args: bigint[]): boolean => {
++    const unlocking = scriptToBytecode([...args].reverse().map((arg) => encodeInt(arg)));
++    const state = vm.evaluate(createTestAuthenticationProgramBch({
++      lockingBytecode: hexToBin(bytecode), unlockingBytecode: unlocking, valueSatoshis: 1000n,
++    }));
++    const top = state.stack[state.stack.length - 1];
++    return state.error === undefined && state.stack.length === 1 && top !== undefined && top.length === 1 && top[0] === 1;
++  };
++
++  it.each([[{ rescheduleStacks: true }], [{}]])('compiles an aggregate contract smaller and equivalently (%o)', (base) => {
++    const plain = compileStringInternal(CONTRACT, base);
++    const moved = compileStringInternal(CONTRACT, { ...base, blockMoves: { kinds: ALL_KINDS } });
++    expect(moved.debug!.bytecode.length).toBeLessThan(plain.debug!.bytecode.length);
++    for (const args of [[1n, 2n], [5n, 9n], [123456n, 654321n], [0n, 0n]]) {
++      expect(evaluate(moved.debug!.bytecode, args)).toEqual(evaluate(plain.debug!.bytecode, args));
++    }
++    // one source-map entry per script element
++    expect(moved.debug!.sourceMap.split(';').length)
++      .toEqual(bytecodeToScript(hexToBin(moved.debug!.bytecode)).length);
++  });
++
++  it('is off by default', () => {
++    expect(compileStringInternal(CONTRACT, {}).bytecode)
++      .toEqual(compileStringInternal(CONTRACT, { blockMoves: false }).bytecode);
++  });
++});

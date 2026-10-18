@@ -1,0 +1,151 @@
+pragma cashscript ^0.14.0;
+
+// BN254 Fp6 = Fp2[v]/(v^3 - xi), xi = 9 + u (noble basis).
+// An Fp6 element is (c0, c1, c2) with each ci an Fp2 pair -> 6 ints carried as
+// (c0a,c0b, c1a,c1b, c2a,c2b) meaning c0 + c1*v + c2*v^2. Builds on Fp2.cash.
+import "./Fp2.cash";
+
+
+
+function fp6Add(int a_c0_c0, int a_c0_c1, int a_c1_c0, int a_c1_c1, int a_c2_c0, int a_c2_c1, int b_c0_c0, int b_c0_c1, int b_c1_c0, int b_c1_c1, int b_c2_c0, int b_c2_c1) returns (int, int, int, int, int, int) {
+    (int c0_c0, int c0_c1) = fp2Add(a_c0_c0, a_c0_c1, b_c0_c0, b_c0_c1);
+    (int c1_c0, int c1_c1) = fp2Add(a_c1_c0, a_c1_c1, b_c1_c0, b_c1_c1);
+    (int c2_c0, int c2_c1) = fp2Add(a_c2_c0, a_c2_c1, b_c2_c0, b_c2_c1);
+    return c0_c0, c0_c1, c1_c0, c1_c1, c2_c0, c2_c1;
+}
+function fp6Sub(int a_c0_c0, int a_c0_c1, int a_c1_c0, int a_c1_c1, int a_c2_c0, int a_c2_c1, int b_c0_c0, int b_c0_c1, int b_c1_c0, int b_c1_c1, int b_c2_c0, int b_c2_c1) returns (int, int, int, int, int, int) {
+    (int c0_c0, int c0_c1) = fp2Sub(a_c0_c0, a_c0_c1, b_c0_c0, b_c0_c1);
+    (int c1_c0, int c1_c1) = fp2Sub(a_c1_c0, a_c1_c1, b_c1_c0, b_c1_c1);
+    (int c2_c0, int c2_c1) = fp2Sub(a_c2_c0, a_c2_c1, b_c2_c0, b_c2_c1);
+    return c0_c0, c0_c1, c1_c0, c1_c1, c2_c0, c2_c1;
+}
+function fp6Neg(int a_c0_c0, int a_c0_c1, int a_c1_c0, int a_c1_c1, int a_c2_c0, int a_c2_c1) returns (int, int, int, int, int, int) {
+    (int c0_c0, int c0_c1) = fp2Neg(a_c0_c0, a_c0_c1);
+    (int c1_c0, int c1_c1) = fp2Neg(a_c1_c0, a_c1_c1);
+    (int c2_c0, int c2_c1) = fp2Neg(a_c2_c0, a_c2_c1);
+    return c0_c0, c0_c1, c1_c0, c1_c1, c2_c0, c2_c1;
+}
+// multiply by v: v*(c0 + c1 v + c2 v^2) = xi*c2 + c0 v + c1 v^2
+function fp6MulByV(int a_c0_c0, int a_c0_c1, int a_c1_c0, int a_c1_c1, int a_c2_c0, int a_c2_c1) returns (int, int, int, int, int, int) {
+    (int n0_c0, int n0_c1) = fp2MulXi(a_c2_c0, a_c2_c1);
+    return n0_c0, n0_c1, a_c0_c0, a_c0_c1, a_c1_c0, a_c1_c1;
+}
+// full Fp6 multiply (Karatsuba over Fp2 with v^3 = xi reduction)
+function fp6Mul(int a_c0_c0, int a_c0_c1, int a_c1_c0, int a_c1_c1, int a_c2_c0, int a_c2_c1, int b_c0_c0, int b_c0_c1, int b_c1_c0, int b_c1_c1, int b_c2_c0, int b_c2_c1) returns (int, int, int, int, int, int) {
+    (int t0_c0, int t0_c1) = fp2Mul(a_c0_c0, a_c0_c1, b_c0_c0, b_c0_c1);
+    (int t1_c0, int t1_c1) = fp2Mul(a_c1_c0, a_c1_c1, b_c1_c0, b_c1_c1);
+    (int t2_c0, int t2_c1) = fp2Mul(a_c2_c0, a_c2_c1, b_c2_c0, b_c2_c1);
+
+    // c0 = t0 + xi*((a1+a2)(b1+b2) - t1 - t2)
+    (int s1_c0, int s1_c1) = fp2Add(a_c1_c0, a_c1_c1, a_c2_c0, a_c2_c1);
+    (int s2_c0, int s2_c1) = fp2Add(b_c1_c0, b_c1_c1, b_c2_c0, b_c2_c1);
+    (int p1_c0, int p1_c1) = fp2Mul(s1_c0, s1_c1, s2_c0, s2_c1);
+    (int d1_c0, int d1_c1) = fp2Sub(p1_c0, p1_c1, t1_c0, t1_c1);
+    (int d2_c0, int d2_c1) = fp2Sub(d1_c0, d1_c1, t2_c0, t2_c1);
+    (int x1_c0, int x1_c1) = fp2MulXi(d2_c0, d2_c1);
+    (int c0_c0, int c0_c1) = fp2Add(t0_c0, t0_c1, x1_c0, x1_c1);
+
+    // c1 = (a0+a1)(b0+b1) - t0 - t1 + xi*t2
+    (int s3_c0, int s3_c1) = fp2Add(a_c0_c0, a_c0_c1, a_c1_c0, a_c1_c1);
+    (int s4_c0, int s4_c1) = fp2Add(b_c0_c0, b_c0_c1, b_c1_c0, b_c1_c1);
+    (int p2_c0, int p2_c1) = fp2Mul(s3_c0, s3_c1, s4_c0, s4_c1);
+    (int d3_c0, int d3_c1) = fp2Sub(p2_c0, p2_c1, t0_c0, t0_c1);
+    (int d4_c0, int d4_c1) = fp2Sub(d3_c0, d3_c1, t1_c0, t1_c1);
+    (int x2_c0, int x2_c1) = fp2MulXi(t2_c0, t2_c1);
+    (int c1_c0, int c1_c1) = fp2Add(d4_c0, d4_c1, x2_c0, x2_c1);
+
+    // c2 = (a0+a2)(b0+b2) - t0 - t2 + t1
+    (int s5_c0, int s5_c1) = fp2Add(a_c0_c0, a_c0_c1, a_c2_c0, a_c2_c1);
+    (int s6_c0, int s6_c1) = fp2Add(b_c0_c0, b_c0_c1, b_c2_c0, b_c2_c1);
+    (int p3_c0, int p3_c1) = fp2Mul(s5_c0, s5_c1, s6_c0, s6_c1);
+    (int d5_c0, int d5_c1) = fp2Sub(p3_c0, p3_c1, t0_c0, t0_c1);
+    (int d6_c0, int d6_c1) = fp2Sub(d5_c0, d5_c1, t2_c0, t2_c1);
+    (int c2_c0, int c2_c1) = fp2Add(d6_c0, d6_c1, t1_c0, t1_c1);
+
+    return c0_c0, c0_c1, c1_c0, c1_c1, c2_c0, c2_c1;
+}
+function fp6Sqr(int a_c0_c0, int a_c0_c1, int a_c1_c0, int a_c1_c1, int a_c2_c0, int a_c2_c1) returns (int, int, int, int, int, int) {
+    (int c_c0_c0, int c_c0_c1, int c_c1_c0, int c_c1_c1, int c_c2_c0, int c_c2_c1) = fp6Mul(a_c0_c0, a_c0_c1, a_c1_c0, a_c1_c1, a_c2_c0, a_c2_c1, a_c0_c0, a_c0_c1, a_c1_c0, a_c1_c1, a_c2_c0, a_c2_c1);
+    return c_c0_c0, c_c0_c1, c_c1_c0, c_c1_c1, c_c2_c0, c_c2_c1;
+}
+function fp6Inv(int c0a,int c0b,int c1a,int c1b,int c2a,int c2b) returns (int,int,int,int,int,int) {
+    // t0 = c0^2 - xi(c2 c1)
+    (int sq0a,int sq0b) = fp2Sqr(c0a, c0b);
+    (int m21a,int m21b) = fp2Mul(c2a, c2b, c1a, c1b);
+    (int xm21a,int xm21b) = fp2MulXi(m21a, m21b);
+    (int t0a,int t0b) = fp2Sub(sq0a, sq0b, xm21a, xm21b);
+    // t1 = xi(c2^2) - c0 c1
+    (int sq2a,int sq2b) = fp2Sqr(c2a, c2b);
+    (int xsq2a,int xsq2b) = fp2MulXi(sq2a, sq2b);
+    (int m01a,int m01b) = fp2Mul(c0a, c0b, c1a, c1b);
+    (int t1a,int t1b) = fp2Sub(xsq2a, xsq2b, m01a, m01b);
+    // t2 = c1^2 - c0 c2
+    (int sq1a,int sq1b) = fp2Sqr(c1a, c1b);
+    (int m02a,int m02b) = fp2Mul(c0a, c0b, c2a, c2b);
+    (int t2a,int t2b) = fp2Sub(sq1a, sq1b, m02a, m02b);
+    // norm = xi(c2 t1 + c1 t2) + c0 t0
+    (int ct1a,int ct1b) = fp2Mul(c2a, c2b, t1a, t1b);
+    (int ct2a,int ct2b) = fp2Mul(c1a, c1b, t2a, t2b);
+    (int suma,int sumb) = fp2Add(ct1a, ct1b, ct2a, ct2b);
+    (int xa,int xb) = fp2MulXi(suma, sumb);
+    (int c0t0a,int c0t0b) = fp2Mul(c0a, c0b, t0a, t0b);
+    (int na,int nb) = fp2Add(xa, xb, c0t0a, c0t0b);
+    (int fa,int fb) = fp2Inv(na, nb);
+    (int r0a,int r0b) = fp2Mul(fa, fb, t0a, t0b);
+    (int r1a,int r1b) = fp2Mul(fa, fb, t1a, t1b);
+    (int r2a,int r2b) = fp2Mul(fa, fb, t2a, t2b);
+    return r0a, r0b, r1a, r1b, r2a, r2b;
+}
+// Fp6 Frobenius for ODD power: fp2Frob = conjugate. k1/k2 = FP6_C1[k]/FP6_C2[k].
+function fp6FrobOdd(
+    int x0a,int x0b,int x1a,int x1b,int x2a,int x2b,
+    int k1a,int k1b,int k2a,int k2b
+) returns (int,int,int,int,int,int) {
+    (int d0a,int d0b) = fp2Conj(x0a, x0b);
+    (int c1a,int c1b) = fp2Conj(x1a, x1b);
+    (int d1a,int d1b) = fp2Mul(c1a, c1b, k1a, k1b);
+    (int c2a,int c2b) = fp2Conj(x2a, x2b);
+    (int d2a,int d2b) = fp2Mul(c2a, c2b, k2a, k2b);
+    return d0a, d0b, d1a, d1b, d2a, d2b;
+}
+// Fp6 Frobenius for EVEN power: fp2Frob = identity.
+function fp6FrobEven(
+    int x0a,int x0b,int x1a,int x1b,int x2a,int x2b,
+    int k1a,int k1b,int k2a,int k2b
+) returns (int,int,int,int,int,int) {
+    (int d1a,int d1b) = fp2Mul(x1a, x1b, k1a, k1b);
+    (int d2a,int d2b) = fp2Mul(x2a, x2b, k2a, k2b);
+    return x0a, x0b, d1a, d1b, d2a, d2b;
+}
+// multiply an Fp6 by an Fp2 constant (each Fp2 coord * k).
+function fp6MulByFp2(
+    int x0a,int x0b,int x1a,int x1b,int x2a,int x2b, int ka,int kb
+) returns (int,int,int,int,int,int) {
+    (int r0a,int r0b) = fp2Mul(x0a, x0b, ka, kb);
+    (int r1a,int r1b) = fp2Mul(x1a, x1b, ka, kb);
+    (int r2a,int r2b) = fp2Mul(x2a, x2b, ka, kb);
+    return r0a, r0b, r1a, r1b, r2a, r2b;
+}
+// Fp6 * sparse (b0, b1, 0) — used by the Miller-loop sparse multiply mul034.
+function fp6Mul01(int c0a,int c0b,int c1a,int c1b,int c2a,int c2b, int b0a,int b0b,int b1a,int b1b) returns (int,int,int,int,int,int) {
+    (int t0a,int t0b) = fp2Mul(c0a, c0b, b0a, b0b);
+    (int t1a,int t1b) = fp2Mul(c1a, c1b, b1a, b1b);
+    // r0 = xi*((c1+c2)*b1 - t1) + t0
+    (int s12a,int s12b) = fp2Add(c1a, c1b, c2a, c2b);
+    (int m12a,int m12b) = fp2Mul(s12a, s12b, b1a, b1b);
+    (int u0a,int u0b) = fp2Sub(m12a, m12b, t1a, t1b);
+    (int xu0a,int xu0b) = fp2MulXi(u0a, u0b);
+    (int r0a,int r0b) = fp2Add(xu0a, xu0b, t0a, t0b);
+    // r1 = (b0+b1)*(c0+c1) - t0 - t1
+    (int sba,int sbb) = fp2Add(b0a, b0b, b1a, b1b);
+    (int sca,int scb) = fp2Add(c0a, c0b, c1a, c1b);
+    (int m1a,int m1b) = fp2Mul(sba, sbb, sca, scb);
+    (int u1a,int u1b) = fp2Sub(m1a, m1b, t0a, t0b);
+    (int r1a,int r1b) = fp2Sub(u1a, u1b, t1a, t1b);
+    // r2 = (c0+c2)*b0 - t0 + t1
+    (int s02a,int s02b) = fp2Add(c0a, c0b, c2a, c2b);
+    (int m2a,int m2b) = fp2Mul(s02a, s02b, b0a, b0b);
+    (int u2a,int u2b) = fp2Sub(m2a, m2b, t0a, t0b);
+    (int r2a,int r2b) = fp2Add(u2a, u2b, t1a, t1b);
+    return r0a, r0b, r1a, r1b, r2a, r2b;
+}

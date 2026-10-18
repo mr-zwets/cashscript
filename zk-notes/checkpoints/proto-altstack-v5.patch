@@ -1,0 +1,563 @@
+diff --git a/packages/cashc/src/compiler.ts b/packages/cashc/src/compiler.ts
+index 61a3b0d0..ace8ab58 100644
+--- a/packages/cashc/src/compiler.ts
++++ b/packages/cashc/src/compiler.ts
+@@ -109,6 +109,10 @@ export interface InternalCompilerOptions extends CompilerOptions {
+   // Keep every function called from a loop OP_DEFINE'd (the pre-co-8 rule) instead of only those
+   // called inside a branch that repeats. For tests and tooling.
+   branchAwareLoopInlining?: boolean;
++  // Altstack parking inside rescheduled blocks (rescheduleStacks only): values whose next use is
++  // far away are moved to the altstack (OP_TOALTSTACK) and fetched back (OP_FROMALTSTACK) instead
++  // of being buried under and later rolled past intermediate values. Default true. For experiments.
++  altstackParking?: boolean;
+ }
+ 
+ export type ScopedReassignment = 'replace' | 'rename';
+@@ -179,7 +183,7 @@ function compileImpl(
+     // only to keep them out of the serialized artifact options
+     // eslint-disable-next-line @typescript-eslint/no-unused-vars
+     disableDefSinking, disableConstantHoisting, scopedReassignment, loopInversion, constantHoisting,
+-    branchAwareLoopInlining,
++    branchAwareLoopInlining, altstackParking,
+     ...artifactCompilerOptions
+   } = compilerOptions;
+   const mergedCompilerOptions = { ...DEFAULT_COMPILER_OPTIONS, ...artifactCompilerOptions };
+@@ -253,6 +257,7 @@ function compileImpl(
+       mainInArity: ast.contract!.functions[0].parameters.length + constructorParamLength,
+       objective: mergedCompilerOptions.optimizeFor ?? 'opcost',
+       constructorParamLength,
++      altstackParking: altstackParking ?? true,
+     }));
+     // The rescheduler re-emits blocks one at a time, so redundancies across block boundaries
+     // (OP_SWAP OP_SWAP, OP_DROP OP_DROP, ...) are left for a final pass of the main optimiser,
+diff --git a/packages/cashc/src/stack-rescheduling.ts b/packages/cashc/src/stack-rescheduling.ts
+index 06cfd1b2..276b3260 100644
+--- a/packages/cashc/src/stack-rescheduling.ts
++++ b/packages/cashc/src/stack-rescheduling.ts
+@@ -83,6 +83,7 @@ import {
+   encodeInt,
+   generateSourceMap,
+   optimiseBytecode,
++  scriptToAsm,
+   scriptToBytecode,
+   sourceMapToLocationData,
+ } from '@cashscript/utils';
+@@ -94,6 +95,7 @@ export interface RescheduleOptions {
+   mainInArity: number; // spend parameters + constructor parameters
+   objective: 'size' | 'opcost';
+   constructorParamLength: number;
++  altstackParking?: boolean;
+ }
+ 
+ export interface RescheduleOutcome {
+@@ -196,12 +198,12 @@ let nodeCounter = 0;
+ // Lift a script into [block | ctrl] items over a symbolic stack of `inArity` opaque
+ // entry slots. Throws on anything it cannot model (dynamic PICK depths, unknown opcodes,
+ // OP_DEPTH, ...) — callers treat a throw as "keep the original".
+-function decompile(script: Script, arities: Map<number, FunctionArity>, inArity: number): Item[] {
++function decompile(script: Script, arities: Map<number, FunctionArity>, inArity: number, altArity = 0): Item[] {
+   const items: Item[] = [];
+   let main: Ref[] = Array.from({ length: inArity }, (_, i) => ({ k: 'in', i } as Ref));
+-  let alt: Ref[] = [];
++  let alt: Ref[] = Array.from({ length: altArity }, (_, i) => ({ k: 'ain', i } as Ref));
+   let entryDepth = inArity;
+-  let entryAlt = 0;
++  let entryAlt = altArity;
+   let rawStart = 0;
+   let blockNodes: DagNode[] = [];
+   const ctrlDepth: { m: number; a: number }[] = [];
+@@ -378,10 +380,20 @@ interface EmitState {
+   useCount: Map<string, number>;
+   remaining: Set<number>;
+   cost: number; // accumulated static op-cost of `out`
++  // values parked on the altstack by this block (bottom -> top), above any entry altstack
++  // items that pass through untouched. A parked key is never also on `stk`.
++  alt: string[];
++  seq: number[]; // node ids in computation order
+ }
+ 
+ const cloneState = (s: EmitState): EmitState => ({
+-  out: [...s.out], stk: [...s.stk], useCount: new Map(s.useCount), remaining: new Set(s.remaining), cost: s.cost,
++  out: [...s.out],
++  stk: [...s.stk],
++  useCount: new Map(s.useCount),
++  remaining: new Set(s.remaining),
++  cost: s.cost,
++  alt: [...s.alt],
++  seq: [...s.seq],
+ });
+ 
+ const appendOp = (s: EmitState, el: OpOrData): void => {
+@@ -398,6 +410,14 @@ const pushNum = (s: EmitState, value: number): void => { appendOp(s, encodeInt(B
+ // above it are preserved
+ function bring(s: EmitState, key: string, move: boolean): void {
+   const idx = move ? deepestIndex(s.stk, key) : topmostIndex(s.stk, key);
++  if (idx < 0 && s.alt[s.alt.length - 1] === key) {
++    // parked on top of the altstack: fetch it (consuming), or fetch a copy and re-park
++    appendOp(s, Op.OP_FROMALTSTACK);
++    if (move) s.alt.pop();
++    else { appendOp(s, Op.OP_DUP); appendOp(s, Op.OP_TOALTSTACK); }
++    s.stk.push(key);
++    return;
++  }
+   if (idx < 0) throw new Error(`value not on stack: ${key}`);
+   const depth = s.stk.length - 1 - idx;
+   if (move) {
+@@ -429,12 +449,87 @@ function bringRef(s: EmitState, ref: Ref, consumeContext: boolean, exitNeed: Map
+   }
+ }
+ 
++// pop the top parked value back onto the main stack
++const unparkOne = (s: EmitState): void => {
++  const key = s.alt.pop();
++  if (key === undefined) throw new Error('altstack parking underflow');
++  appendOp(s, Op.OP_FROMALTSTACK);
++  s.stk.push(key);
++};
++
++// Arguments are staged contiguously on top of the main stack, so a parked argument can only be
++// fetched directly (OP_FROMALTSTACK at its turn) when it is on top of the altstack at that
++// moment. Simulate the staging; if any parked argument would be buried under other parked
++// values at its turn, first unpark down to the deepest parked argument (the values unparked on
++// the way land on the main stack below the staged arguments, like any other value).
++// `remaining(key)` is the number of uses left before this staging (incl. it), `extra(key)`
++// the uses that come after it; a fetch moves the value iff it is the last.
++function prepareParkedArgs(
++  s: EmitState, staged: Ref[], remaining: (key: string) => number, extra: (key: string) => number,
++): void {
++  const alt = [...s.alt];
++  const onMain = new Set<string>();
++  const uses = new Map<string, number>();
++  const needed = new Set<string>();
++  let conflict = false;
++  staged.forEach((r) => {
++    const key = keyOf(r);
++    if (key === undefined || s.stk.includes(key) || onMain.has(key)) return;
++    if (!s.alt.includes(key)) return;
++    needed.add(key);
++    const rem = uses.get(key) ?? remaining(key);
++    const survives = rem > 1 || extra(key) > 0;
++    uses.set(key, rem - 1);
++    if (alt[alt.length - 1] !== key) { conflict = true; return; }
++    if (!survives) { alt.pop(); onMain.add(key); }
++  });
++  if (!conflict) return;
++  while ([...needed].some((key) => s.alt.includes(key))) unparkOne(s);
++}
++
++// Which values to park: every value whose next use is at least `threshold` scheduling steps
++// away, or (with `keys`) exactly the listed values whenever they are eligible.
++export interface ParkPolicy { threshold?: number; exitOnly?: boolean; keys?: Set<string> }
++export interface ParkLog { eligible: Set<string>; parked: Set<string> }
++
++// Park values: while the top of the main stack holds an eligible value (no other copy on the
++// main stack, next node use at least two steps away) that the policy selects, move it to the
++// altstack. `t` is the index of the step just completed (-1 at block entry).
++function parkFarValues(
++  s: EmitState, t: number, policy: ParkPolicy, usePositions: Map<string, number[]>,
++  exitNeed: Map<string, number>, log?: ParkLog,
++): void {
++  while (s.stk.length > 0) {
++    const key = s.stk[s.stk.length - 1];
++    if (key.startsWith('#')) return;
++    if (s.stk.indexOf(key) !== s.stk.length - 1) return;
++    const next = (usePositions.get(key) ?? []).find((p) => p > t);
++    // exit-only values: computed ones may be parked (the exit assembly fetches them lazily);
++    // entry values stay put (they usually pass through in place)
++    if (next === undefined && (!key.startsWith('n') || (exitNeed.get(key) ?? 0) === 0)) return;
++    if (next === undefined && policy.keys === undefined && policy.exitOnly !== true) return;
++    const distance = next === undefined ? Infinity : next - t;
++    if (distance < 2) return;
++    log?.eligible.add(key);
++    const selected = policy.keys !== undefined ? policy.keys.has(key) : distance >= (policy.threshold ?? Infinity);
++    if (!selected) return;
++    log?.parked.add(key);
++    appendOp(s, Op.OP_TOALTSTACK);
++    s.stk.pop();
++    s.alt.push(key);
++  }
++}
++
+ // compute one DAG node on top of the stack, staging arguments in the callee's chosen
+ // entry order for permuted OP_INVOKE targets
+ function computeNode(s: EmitState, node: DagNode, exitNeed: Map<string, number>, calleePerms: Map<number, number[]>): void {
+   s.remaining.delete(node.id);
++  s.seq.push(node.id);
+   const perm = node.kind === 'invoke' ? calleePerms.get(node.code) : undefined;
+   const staged = perm !== undefined ? perm.map((i) => node.ins[i]) : node.ins;
++  if (s.alt.length > 0) {
++    prepareParkedArgs(s, staged, (key) => s.useCount.get(key) ?? 0, (key) => exitNeed.get(key) ?? 0);
++  }
+   staged.forEach((r) => bringRef(s, r, true, exitNeed));
+   if (node.kind === 'invoke') { pushNum(s, node.code); appendOp(s, Op.OP_INVOKE); } else appendOp(s, node.code);
+   s.stk.length -= node.ins.length;
+@@ -444,6 +539,11 @@ function computeNode(s: EmitState, node: DagNode, exitNeed: Map<string, number>,
+ interface EmitOptions {
+   entrySeed?: string[]; // stack labels at block entry, bottom -> top (defaults to m0..mN-1)
+   calleePerms?: Map<number, number[]>;
++  // replay this node order (node ids) instead of choosing one; with `park`, park far values
++  seq?: number[];
++  park?: ParkPolicy; // altstack parking policy (requires `seq`)
++  parkLog?: ParkLog; // receives the eligible and the parked values
++  seqOut?: number[]; // receives the chosen node order
+ }
+ 
+ const NO_PERMS: Map<number, number[]> = new Map();
+@@ -483,7 +583,7 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+   [...exit, ...exitAlt].forEach((r) => bump(exitNeed, keyOf(r)));
+ 
+   const initial: EmitState = {
+-    out: [], stk: [], useCount, remaining: new Set(order.map((nd) => nd.id)), cost: 0,
++    out: [], stk: [], useCount, remaining: new Set(order.map((nd) => nd.id)), cost: 0, alt: [], seq: [],
+   };
+   for (let i = 0; i < n; i += 1) initial.stk.push(options.entrySeed?.[i] ?? `m${i}`);
+   if (!altPass) for (let i = 0; i < p; i += 1) { appendOp(initial, Op.OP_FROMALTSTACK); initial.stk.push(`a${p - 1 - i}`); }
+@@ -522,9 +622,13 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+     const need = new Map(exitNeed);
+     const desired = altPass ? [...exit] : [...exit, ...[...exitAlt].reverse()];
+     const desiredKeys = desired.map((r) => (r.k === 'const' ? undefined : keyOf(r)));
+-    const inPlace = s.stk.length >= desired.length
++    // parked values are fetched lazily while assembling when each is on top of the altstack
++    // at its turn; otherwise everything is unparked first
++    if (s.alt.length > 0) prepareParkedArgs(s, desired, (key) => need.get(key) ?? 0, () => 0);
++    const inPlace = s.alt.length === 0 && s.stk.length >= desired.length
+       && desiredKeys.every((dk, i) => dk !== undefined && s.stk[s.stk.length - desired.length + i] === dk);
+     if (!inPlace) desired.forEach((r) => bringRef(s, r, false, need));
++    if (s.alt.length > 0) throw new Error('parked value left on the altstack at block exit');
+ 
+     const K = desired.length;
+     const junk = s.stk.length - K;
+@@ -543,6 +647,33 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+     if (!altPass) for (let i = 0; i < exitAlt.length; i += 1) appendOp(s, Op.OP_TOALTSTACK);
+   };
+ 
++  if (options.seq !== undefined) {
++    // replay a fixed node order, parking values whose next use is far away
++    const state = initial;
++    const byId = new Map(order.map((nd) => [nd.id, nd]));
++    const usePositions = new Map<string, number[]>();
++    options.seq.forEach((id, t) => {
++      const nd = byId.get(id);
++      if (nd === undefined) throw new Error('replay order does not match the block');
++      nd.ins.forEach((r) => {
++        const key = keyOf(r);
++        if (key === undefined) return;
++        const list = usePositions.get(key) ?? [];
++        if (list[list.length - 1] !== t) list.push(t);
++        usePositions.set(key, list);
++      });
++    });
++    if (options.seq.length !== order.length) throw new Error('replay order does not match the block');
++    const policy = options.park ?? {};
++    parkFarValues(state, -1, policy, usePositions, exitNeed, options.parkLog);
++    options.seq.forEach((id, t) => {
++      computeNode(state, byId.get(id)!, exitNeed, calleePerms);
++      parkFarValues(state, t, policy, usePositions, exitNeed, options.parkLog);
++    });
++    finish(state);
++    return state.out;
++  }
++
+   if (strategy !== 'beam') {
+     const state = initial;
+     while (state.remaining.size > 0) {
+@@ -558,6 +689,7 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+       }
+       computeNode(state, node, exitNeed, calleePerms);
+     }
++    options.seqOut?.push(...state.seq);
+     finish(state);
+     return state.out;
+   }
+@@ -583,11 +715,14 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+     beam = next.slice(0, BEAM_WIDTH);
+   }
+   let best: Script | undefined;
++  let bestSeq: number[] = [];
+   let bestCost = Infinity;
+   beam.forEach((state) => {
++    const seq = [...state.seq];
+     finish(state);
+-    if (state.cost < bestCost) { bestCost = state.cost; best = state.out; }
++    if (state.cost < bestCost) { bestCost = state.cost; best = state.out; bestSeq = seq; }
+   });
++  options.seqOut?.push(...bestSeq);
+   // A dead-ended beam means no complete schedule was found; initial.out would be a script that
+   // computed nothing, so fail closed — every caller catches and keeps the original body.
+   if (best === undefined) throw new Error('beam search dead-ended without a complete schedule');
+@@ -642,6 +777,62 @@ function reoptimiseBody(script: Script): Script {
+   return optimiseBytecode(script, script.map(() => location), [], [], [], [], 0).script;
+ }
+ 
++// ---------- translation validation of parked blocks ----------
++
++// Hash-consed canonical form of a value: two refs get the same name iff they denote the same
++// expression over the block's entry slots. Node ids are globally unique, so one instance can
++// canonicalise two DAGs; `seed` relabels entry slots of a permuted entry layout (position i
++// holds seed[i]); `perms` undoes permuted callee conventions (a call to a permuted callee
++// stages original argument perm[j] at stack position j).
++class Canon {
++  constructor(private perms: Map<number, number[]> = NO_PERMS) {}
++
++  private table = new Map<string, number>();
++  private memo = new Map<number, number>(); // node id -> canonical id
++
++  ref(ref: Ref, seed?: string[]): string {
++    if (ref.k === 'const') return `k${binToHex(ref.data)}`;
++    if (ref.k === 'in') return seed?.[ref.i] ?? `m${ref.i}`;
++    if (ref.k === 'ain') return `a${ref.i}`;
++    return `n${this.node(ref.node, seed)}_${ref.j}`;
++  }
++
++  node(node: DagNode, seed?: string[]): number {
++    const known = this.memo.get(node.id);
++    if (known !== undefined) return known;
++    const perm = seed !== undefined && node.kind === 'invoke' ? this.perms.get(node.code) : undefined;
++    let { ins } = node;
++    if (perm !== undefined) {
++      ins = new Array<Ref>(ins.length);
++      perm.forEach((original, j) => { ins[original] = node.ins[j]; });
++    }
++    const key = `${node.kind}:${node.code}:${node.nout}(${ins.map((r) => this.ref(r, seed)).join(',')})`;
++    let id = this.table.get(key);
++    if (id === undefined) { id = this.table.size; this.table.set(key, id); }
++    this.memo.set(node.id, id);
++    return id;
++  }
++}
++
++// The emitted block must compute exactly the original block's exit stacks (main and alt) from
++// the same entry stacks, with no extra (dead) computation and no control flow.
++function blockEquivalent(
++  block: BasicBlock, script: Script, arities: Map<number, FunctionArity>,
++  entrySeed: string[] | undefined, calleePerms: Map<number, number[]>,
++): boolean {
++  let items: Item[];
++  try { items = decompile(script, arities, block.entryDepth, block.entryAlt); } catch { return false; }
++  if (items.length !== 1 || !('block' in items[0])) return false;
++  const emitted = items[0].block;
++  if (hasDeadComputation(emitted)) return false;
++  const canon = new Canon(calleePerms);
++  const seed = entrySeed ?? Array.from({ length: block.entryDepth }, (_, i) => `m${i}`);
++  const same = (a: Ref[], b: Ref[]): boolean => (
++    a.length === b.length && a.every((r, i) => canon.ref(r) === canon.ref(b[i], seed))
++  );
++  return same(block.exit, emitted.exit) && same(block.exitAlt, emitted.exitAlt);
++}
++
+ // ---------- cost models ----------
+ 
+ // Static estimate of the schedule-dependent part of the BCH2026 op-cost meter. Value ops'
+@@ -679,8 +870,16 @@ interface RecompiledScript {
+ interface RecompileOptions {
+   entryPerm?: number[]; // permuted entry layout of the FIRST block (bottom -> top holds slot perm[j])
+   calleePerms?: Map<number, number[]>;
++  // altstack parking: functions whose bodies are altstack-neutral (values may stay parked
++  // across their invocation); undefined disables parking
++  altSafe?: Set<number>;
+ }
+ 
++// parking thresholds tried per block (scheduling steps until the next use)
++const PARK_THRESHOLDS = [2, 3, 4, 6, 9, 14];
++// blocks smaller than this only try the thresholds (no per-value search)
++const PARK_SEARCH_MIN_NODES = 6;
++
+ const isIdentityPerm = (perm: number[] | undefined): boolean => perm === undefined || perm.every((v, i) => v === i);
+ 
+ // over ALL block nodes (not just exit-reachable ones): a dead invoke of a permuted callee
+@@ -743,7 +942,74 @@ function recompileScript(
+     if (dead && !rawValid) throw new Error('dead computation in a block that cannot keep its original ops');
+     // per-block min(original, rescheduled): both reproduce the block's entry->exit
+     // transform AND its boundary layout, so they compose freely
+-    const mine = dead ? undefined : peephole(emitBlock(block, strategy, { entrySeed, calleePerms }));
++    let mine: Script | undefined;
++    if (!dead) {
++      const seq: number[] = [];
++      const unparked = peephole(emitBlock(block, strategy, { entrySeed, calleePerms, seqOut: seq }));
++      mine = unparked;
++      const { altSafe } = options;
++      const parkable = altSafe !== undefined
++        && block.nodes.every((nd) => nd.kind !== 'invoke' || altSafe.has(nd.code));
++      if (parkable) {
++        let bestParked = new Set<string>();
++        const eligible = new Set<string>();
++        let bestCost = scriptCost(mine, objective);
++        PARK_THRESHOLDS.flatMap((threshold) => [false, true].map((exitOnly) => ({ threshold, exitOnly }))).forEach(({ threshold, exitOnly }) => {
++          let parked: Script;
++          const parkLog: ParkLog = { eligible: new Set(), parked: new Set() };
++          try {
++            parked = peephole(emitBlock(block, strategy, {
++              entrySeed, calleePerms, seq, park: { threshold, exitOnly }, parkLog,
++            }));
++          } catch { return; }
++          const park = threshold;
++          if (process.env.CASHC_DEBUG_PARK !== undefined) {
++            // eslint-disable-next-line no-console
++            console.error(`[park] block nodes=${block.nodes.length} T=${park} ${calculateBytesize(mine!)}B/${scriptCost(mine!, objective)} -> ${calculateBytesize(parked)}B/${scriptCost(parked, objective)}`);
++            if (process.env.CASHC_DEBUG_PARK === 'asm' && block.nodes.length >= 6 && block.nodes.length <= 14 && park === 4) {
++              // eslint-disable-next-line no-console
++              console.error(`  base: ${scriptToAsm(mine!)}
++  park: ${scriptToAsm(parked)}`);
++            }
++          }
++          const cost = scriptCost(parked, objective);
++          parkLog.eligible.forEach((key) => eligible.add(key));
++          if (cost < bestCost) { mine = parked; bestCost = cost; bestParked = parkLog.parked; }
++        });
++        // hill-climb on the parked set: toggle one value at a time, keep strict improvements
++        if (eligible.size > 0 && block.nodes.length >= PARK_SEARCH_MIN_NODES) {
++          const keys = new Set(bestParked);
++          const candidates = [...eligible];
++          for (let pass = 0; pass < 2; pass += 1) {
++            let improved = false;
++            candidates.forEach((key) => {
++              const trial = new Set(keys);
++              if (trial.has(key)) trial.delete(key); else trial.add(key);
++              let parked: Script;
++              try {
++                parked = peephole(emitBlock(block, strategy, { entrySeed, calleePerms, seq, park: { keys: trial } }));
++              } catch { return; }
++              const cost = scriptCost(parked, objective);
++              if (cost < bestCost) {
++                mine = parked; bestCost = cost; improved = true;
++                if (keys.has(key)) keys.delete(key); else keys.add(key);
++              }
++            });
++            if (!improved) break;
++          }
++        }
++        // translation validation: a parked schedule must denote exactly the block's exit stacks
++        if (mine !== unparked && !blockEquivalent(block, mine!, arities, entrySeed, calleePerms)) {
++          if (process.env.CASHC_DEBUG_PARK !== undefined) {
++            // eslint-disable-next-line no-console
++            console.error(`[park] validation failed (unparked ok: ${blockEquivalent(block, unparked, arities, entrySeed, calleePerms)}) entryDepth=${block.entryDepth} entryAlt=${block.entryAlt} exit=${block.exit.length} exitAlt=${block.exitAlt.length} seed=${entrySeed?.join(',')}
++  parked: ${scriptToAsm(mine!)}
++  unparked: ${scriptToAsm(unparked)}`);
++          }
++          mine = unparked;
++        }
++      }
++    }
+     const useMine = mine !== undefined
+       && (!rawValid || scriptCost(mine, objective) < scriptCost(block.rawOps, objective));
+     const chosen = useMine ? mine! : block.rawOps;
+@@ -802,6 +1068,52 @@ const hasAmbiguousInvoke = (script: Script): boolean => script.some((el, i) => (
+   elOpcode(el) === Op.OP_INVOKE && (i === 0 || constNumOf(script[i - 1]) === undefined)
+ ));
+ 
++// Functions whose invocation leaves the caller's altstack untouched: the body (and every
++// function it invokes) never pops below its entry altstack depth and returns at the same
++// depth on every path. Values parked by a caller may stay parked across such a call.
++function altNeutralFunctions(d: Dissected): Set<number> {
++  const memo = new Map<number, boolean>();
++  const check = (id: number): boolean => {
++    const known = memo.get(id);
++    if (known !== undefined) return known;
++    memo.set(id, false); // recursion is treated as unsafe
++    const body = d.bodies.get(id);
++    const ok = body !== undefined && bodyAltNeutral(body, check);
++    memo.set(id, ok);
++    return ok;
++  };
++  d.order.forEach(check);
++  return new Set(d.order.filter((id) => memo.get(id) === true));
++}
++
++function bodyAltNeutral(body: Script, calleeOk: (id: number) => boolean): boolean {
++  let depth = 0;
++  const frames: { kind: 'if' | 'loop'; entry: number; thenEnd?: number }[] = [];
++  for (let i = 0; i < body.length; i += 1) {
++    const op = elOpcode(body[i]);
++    if (op === Op.OP_TOALTSTACK) depth += 1;
++    else if (op === Op.OP_FROMALTSTACK) { depth -= 1; if (depth < 0) return false; }
++    else if (op === Op.OP_IF || op === Op.OP_NOTIF) frames.push({ kind: 'if', entry: depth });
++    else if (op === Op.OP_ELSE) {
++      const f = frames[frames.length - 1];
++      if (f === undefined || f.kind !== 'if' || f.thenEnd !== undefined) return false;
++      f.thenEnd = depth; depth = f.entry;
++    } else if (op === Op.OP_ENDIF) {
++      const f = frames.pop();
++      if (f === undefined || f.kind !== 'if') return false;
++      if (depth !== (f.thenEnd ?? f.entry)) return false;
++    } else if (op === Op.OP_BEGIN) frames.push({ kind: 'loop', entry: depth });
++    else if (op === Op.OP_UNTIL) {
++      const f = frames.pop();
++      if (f === undefined || f.kind !== 'loop' || depth !== f.entry) return false;
++    } else if (op === Op.OP_INVOKE) {
++      const id = i > 0 ? constNumOf(body[i - 1]) : undefined;
++      if (id === undefined || !calleeOk(id)) return false;
++    } else if (op === Op.OP_DEFINE) return false;
++  }
++  return depth === 0 && frames.length === 0;
++}
++
+ // callee-first processing order over the call graph (declaration order on cycles)
+ function calleeFirstOrder(d: Dissected): number[] {
+   const visited = new Set<number>();
+@@ -983,6 +1295,7 @@ interface BodyChoices {
+ // caller falls back to identity layouts wholesale).
+ function rescheduleBodies(
+   d: Dissected, arities: Map<number, FunctionArity>, objective: 'size' | 'opcost', layouts: boolean,
++  altSafe?: Set<number>,
+ ): BodyChoices {
+   const overrides = new Map<number, Script>();
+   const perms = new Map<number, number[]>();
+@@ -1018,7 +1331,7 @@ function rescheduleBodies(
+         let candidate: Script;
+         try {
+           candidate = reoptimiseBody(recompileScript(original, arities, arity.in, strategy, objective, {
+-            entryPerm: perm as number[] | undefined, calleePerms: perms,
++            entryPerm: perm as number[] | undefined, calleePerms: perms, altSafe,
+           }).script);
+         } catch { return; }
+         const cost = bodyCost(candidate, identity ? undefined : (perm as number[]));
+@@ -1115,8 +1428,11 @@ export function applyStackRescheduling(
+   const allScripts = [d.main, ...d.order.map((id) => d.bodies.get(id)!)];
+   const layouts = optimised.logs.length === 0 && !allScripts.some(hasAmbiguousInvoke);
+   const debug = process.env.CASHC_DEBUG_RESCHEDULE !== undefined;
++  const altSafe = options.altstackParking === true ? altNeutralFunctions(d) : undefined;
++  // eslint-disable-next-line no-console
++  if (process.env.CASHC_DEBUG_PARK !== undefined) console.error(`[park] altSafe ${altSafe === undefined ? 'off' : [...altSafe].join(',')} of ${d.order.join(',')}`);
+   try {
+-    choices = rescheduleBodies(d, loggableArities, objective, layouts);
++    choices = rescheduleBodies(d, loggableArities, objective, layouts, altSafe);
+     if (debug && layouts) {
+       // eslint-disable-next-line no-console
+       console.error(`[reschedule] layouts: ${choices.perms.size} permuted of ${d.order.length} bodies (${[...choices.perms.keys()].join(',')})`);
+@@ -1124,7 +1440,7 @@ export function applyStackRescheduling(
+   } catch (e) {
+     if (debug) console.error(`[reschedule] layout experiment fell back to identity: ${(e as Error).message}`); // eslint-disable-line no-console
+     // the layout experiment failed validation somewhere — identity layouts wholesale
+-    choices = rescheduleBodies(d, loggableArities, objective, false);
++    choices = rescheduleBodies(d, loggableArities, objective, false, altSafe);
+   }
+   let { overrides } = choices;
+   let { perms } = choices;
+@@ -1143,7 +1459,9 @@ export function applyStackRescheduling(
+     MAIN_STRATEGIES.forEach((strategy) => {
+       let candidate: RecompiledScript;
+       try {
+-        candidate = recompileScript(d.main, arities, options.mainInArity, strategy, objective, { calleePerms: perms });
++        candidate = recompileScript(d.main, arities, options.mainInArity, strategy, objective, {
++          calleePerms: perms, altSafe,
++        });
+       } catch (e) {
+         if (debug) console.error(`[reschedule] main (${strategy}) failed: ${(e as Error).message}`); // eslint-disable-line no-console
+         return;
+@@ -1156,14 +1474,14 @@ export function applyStackRescheduling(
+   };
+   if (optimised.logs.length === 0) {
+     if (!rescheduleMain() && perms.size > 0) {
+-      ({ overrides, perms } = rescheduleBodies(d, loggableArities, objective, false));
++      ({ overrides, perms } = rescheduleBodies(d, loggableArities, objective, false, altSafe));
+       main = d.main;
+       mainMapping = undefined;
+       rescheduleMain();
+     }
+   } else if (perms.size > 0) {
+     // main cannot be re-emitted (logs) so callee conventions must stay standard
+-    ({ overrides, perms } = rescheduleBodies(d, loggableArities, objective, false));
++    ({ overrides, perms } = rescheduleBodies(d, loggableArities, objective, false, altSafe));
+   }
+ 
+   if (debug) {

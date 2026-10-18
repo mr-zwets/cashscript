@@ -1,0 +1,822 @@
+diff --git a/packages/cashc/src/compiler.ts b/packages/cashc/src/compiler.ts
+index 61a3b0d0..e3eac4a9 100644
+--- a/packages/cashc/src/compiler.ts
++++ b/packages/cashc/src/compiler.ts
+@@ -29,6 +29,9 @@ import {
+ import { sinkDefinitions } from './def-sinking.js';
+ import { applyStackRescheduling } from './stack-rescheduling.js';
+ import GenerateTargetTraversal from './generation/GenerateTargetTraversal.js';
++import {
++  BorrowProbe, BorrowSpec, computeBorrowSpec, computeRuntimeBorrowSpec, computeRuntimeGroupSpec, newBorrowProbe,
++} from './generation/borrowing.js';
+ import { FoldGlobalConstantsTraversal } from './semantic/FoldGlobalConstantsTraversal.js';
+ import SymbolTableTraversal from './semantic/SymbolTableTraversal.js';
+ import UnusedCodeWarningsTraversal from './semantic/UnusedCodeTraversal.js';
+@@ -109,6 +112,27 @@ export interface InternalCompilerOptions extends CompilerOptions {
+   // Keep every function called from a loop OP_DEFINE'd (the pre-co-8 rule) instead of only those
+   // called inside a branch that repeats. For tests and tooling.
+   branchAwareLoopInlining?: boolean;
++  // Borrow-by-depth argument passing (experimental): read-only arguments whose variables already sit
++  // at a call-site-independent depth are read in place by the callee instead of being copied to the
++  // top by the caller (see generation/borrowing.ts).
++  borrowArgs?: boolean;
++  // Internal plumbing for borrowArgs: the convention to compile with, and a probe sink.
++  borrowSpec?: BorrowSpec;
++  borrowProbe?: BorrowProbe;
++  // Stack rescheduling: leave a block's untouched bottom entry slots in place when assembling its
++  // exit layout (needed by borrowArgs; defaults to borrowArgs).
++  reschedulePassThrough?: boolean;
++  // borrowArgs experiments: restrict the borrowing callees to / exclude them from these names
++  borrowOnly?: string[];
++  borrowExclude?: string[];
++  // Greedily drop borrowing callees whose removal shrinks the final bytecode (default true).
++  borrowSelect?: boolean;
++  // Also borrow arguments passed on their final use (left in place, dead, for the caller to drop).
++  borrowFinalUse?: boolean;
++  // Use the runtime-depth borrow variant for these callees (experiment).
++  borrowRuntime?: string[];
++  // Runtime-depth experiment with explicit parameter groups per callee (fallback sites accepted).
++  borrowRuntimeGroups?: Record<string, number[]>;
+ }
+ 
+ export type ScopedReassignment = 'replace' | 'rename';
+@@ -179,9 +203,76 @@ function compileImpl(
+     // only to keep them out of the serialized artifact options
+     // eslint-disable-next-line @typescript-eslint/no-unused-vars
+     disableDefSinking, disableConstantHoisting, scopedReassignment, loopInversion, constantHoisting,
+-    branchAwareLoopInlining,
++    branchAwareLoopInlining, borrowArgs, borrowSpec, borrowProbe, reschedulePassThrough, borrowOnly, borrowExclude,
++    borrowSelect, borrowRuntime, borrowRuntimeGroups,
+     ...artifactCompilerOptions
+   } = compilerOptions;
++
++  // borrowArgs: probe call-site layouts with a plain (codegen-only) compile, derive the static borrow
++  // convention, then prune callees until every call site of a borrowing callee is emitted in place.
++  const borrowEnabled = borrowArgs ?? process.env.CASHC_BORROW_ARGS === '1';
++  if (borrowEnabled && borrowSpec === undefined) {
++    const probe = newBorrowProbe();
++    // probe compiles are silent; a contract that fails to compile is reported by the final compile
++    const silent = { warningListener: (): void => {}, errorListener: undefined, rescheduleStacks: false };
++    let spec: BorrowSpec = new Map();
++    try {
++      compileImpl(code, resolver, { ...compilerOptions, ...silent, borrowArgs: false, borrowProbe: probe }, rewrites);
++      spec = computeBorrowSpec(probe, borrowOnly !== undefined ? new Set(borrowOnly) : undefined);
++      if (borrowExclude !== undefined) spec = new Map([...spec].filter(([name]) => !borrowExclude.includes(name)));
++      if (borrowRuntime !== undefined) {
++        const runtimeNames = new Set(borrowRuntime);
++        spec = new Map([...spec].filter(([name]) => !runtimeNames.has(name)));
++        computeRuntimeBorrowSpec(probe, runtimeNames).forEach((entry, name) => spec.set(name, entry));
++      }
++      if (borrowRuntimeGroups !== undefined) {
++        computeRuntimeGroupSpec(probe, borrowRuntimeGroups).forEach((entry, name) => spec.set(name, entry));
++      }
++    } catch {
++      spec = new Map();
++    }
++    for (let iteration = 0; iteration < 8 && spec.size > 0; iteration += 1) {
++      const check = newBorrowProbe();
++      compileImpl(code, resolver, {
++        ...compilerOptions, ...silent, borrowSpec: spec, borrowProbe: check,
++      }, rewrites);
++      if (process.env.CASHC_DEBUG_BORROW !== undefined) {
++        // eslint-disable-next-line no-console
++        console.error(`[borrow] iteration ${iteration}: ${[...spec].map(([name, entry]) => `${name}{${[...entry.offsets].map(([j, o]) => `${j}@${o}`).join(',')}}`).join(' ')} fallbacks: ${[...check.fallbacks].join(',')}`);
++      }
++      if (check.fallbacks.size === 0) break;
++      // runtime-group entries are an explicit experiment: their fallback sites are accepted
++      spec = new Map([...spec].filter(([name]) => !check.fallbacks.has(name) || borrowRuntimeGroups?.[name] !== undefined));
++      if ([...check.fallbacks].every((name) => borrowRuntimeGroups?.[name] !== undefined)) break;
++    }
++    if (process.env.CASHC_DEBUG_BORROW !== undefined) {
++      // eslint-disable-next-line no-console
++      console.error(`[borrow] spec: ${[...spec].map(([name, entry]) => `${name}{${[...entry.offsets].map(([j, o]) => `${j}@${o}`).join(',')}}`).join(' ')}`);
++    }
++    // borrowSelect: a borrowing invoke is a rescheduling block boundary and a final-use borrow leaves
++    // dead values behind, so borrowing can cost more than it saves; greedily drop each borrowing
++    // callee whose removal shrinks the final bytecode (pre-pruned on cheap codegen-only compiles when
++    // the expensive rescheduler is on)
++    const size = (artifact: Artifact): number => artifact.debug!.bytecode.length;
++    const greedy = (options: CompileOptions & InternalCompilerOptions, label: string): Artifact => {
++      let best = compileImpl(code, resolver, { ...options, borrowSpec: spec }, rewrites);
++      [...spec.keys()].forEach((name) => {
++        const without = new Map([...spec].filter(([other]) => other !== name));
++        const candidate = compileImpl(code, resolver, { ...options, borrowSpec: without }, rewrites);
++        if (process.env.CASHC_DEBUG_BORROW !== undefined) {
++          // eslint-disable-next-line no-console
++          console.error(`[borrow] ${label} without ${name}: ${size(candidate) / 2} B vs ${size(best) / 2} B`);
++        }
++        if (size(candidate) < size(best)) { best = candidate; spec = without; }
++      });
++      return best;
++    };
++    if (borrowSelect === false || spec.size === 0) {
++      return compileImpl(code, resolver, { ...compilerOptions, borrowSpec: spec }, rewrites);
++    }
++    if (compilerOptions.rescheduleStacks) greedy({ ...compilerOptions, ...silent }, 'codegen');
++    return greedy(compilerOptions, 'final');
++  }
+   const mergedCompilerOptions = { ...DEFAULT_COMPILER_OPTIONS, ...artifactCompilerOptions };
+ 
+   // Lexing + parsing
+@@ -228,6 +319,7 @@ function compileImpl(
+   // Code generation
+   const traversal = new GenerateTargetTraversal({
+     ...mergedCompilerOptions, disableInlining, scopedReassignment, loopInversion, branchAwareLoopInlining,
++    borrowSpec, borrowProbe,
+   });
+   ast = ast.accept(traversal) as Ast;
+ 
+@@ -253,6 +345,7 @@ function compileImpl(
+       mainInArity: ast.contract!.functions[0].parameters.length + constructorParamLength,
+       objective: mergedCompilerOptions.optimizeFor ?? 'opcost',
+       constructorParamLength,
++      passThroughBottom: reschedulePassThrough ?? borrowEnabled,
+     }));
+     // The rescheduler re-emits blocks one at a time, so redundancies across block boundaries
+     // (OP_SWAP OP_SWAP, OP_DROP OP_DROP, ...) are left for a final pass of the main optimiser,
+diff --git a/packages/cashc/src/generation/GenerateTargetTraversal.ts b/packages/cashc/src/generation/GenerateTargetTraversal.ts
+index d0aeb519..056b4f9f 100644
+--- a/packages/cashc/src/generation/GenerateTargetTraversal.ts
++++ b/packages/cashc/src/generation/GenerateTargetTraversal.ts
+@@ -81,6 +81,7 @@ import {
+   isRecursive, shouldInline,
+ } from './inlining.js';
+ import type { InternalCompilerOptions, ScopedReassignment } from '../compiler.js';
++import { RUNTIME_BASE_NAME, regionSlotName } from './borrowing.js';
+ 
+ // Scopes nested deeper than this inherit their parent's reassignment strategy instead of trying both,
+ // which bounds the extra code generation passes (see chooseScopedReassignment)
+@@ -96,8 +97,15 @@ interface TraversalState {
+   finalStackUsage: Record<string, StackItem>;
+   inlineRanges: InlineRange[];
+   consumedReads: Set<IdentifierNode>;
++  probeRecords: ProbeRecord[];
+ }
+ 
++// borrowArgs probe observations; kept in the traversal state so that code generation variants that
++// get discarded (see chooseScopedReassignment) do not contribute
++type ProbeRecord =
++  | { kind: 'site'; callee: string; offsets: Array<number | null> }
++  | { kind: 'fallback' | 'inPlace'; callee: string };
++
+ interface InlineRange {
+   startIp: number;
+   endIp: number;
+@@ -124,7 +132,14 @@ export default class GenerateTargetTraversal extends AstTraversal {
+   // Stack arity (parameter/return counts) of every OP_DEFINE'd function, keyed by its
+   // functionId — consumed by post-codegen passes (stack rescheduling) that need OP_INVOKE
+   // stack effects without re-deriving them from the bytecode.
+-  definedFunctionArities: Map<number, { in: number; out: number }> = new Map();
++  definedFunctionArities: Map<number, { in: number; out: number; window?: number }> = new Map();
++
++  // Borrowed parameters of the function body being compiled: parameter name -> region slot name
++  private borrowAlias: Map<string, string> = new Map();
++  // Runtime-depth borrowed parameters: parameter name -> region offset, and the frame's entry height
++  private runtimeBorrow: Map<string, number> = new Map();
++  private runtimeEntryHeight = 0;
++  private probeRecords: ProbeRecord[] = [];
+ 
+   // Tracks right-to-left argument staging for user function calls (see stageUserFunctionArguments)
+   private userCallArgDepth = 0;
+@@ -197,6 +212,7 @@ export default class GenerateTargetTraversal extends AstTraversal {
+ 
+     // The contract is guaranteed to exist here (compileString throws MissingContractError otherwise).
+     node.contract = this.visit(node.contract!) as ContractNode;
++    this.flushBorrowProbe();
+ 
+     this.mergeInlinedDebugInfo();
+ 
+@@ -282,7 +298,14 @@ export default class GenerateTargetTraversal extends AstTraversal {
+     // Emit definitions in ID order so debug.functions[n] corresponds to the n-th define site (id n).
+     definedFunctions.forEach(({ func, compiledResult }, functionId) => {
+       this.frames.push(this.buildDebugFrame(func, compiledResult, functionId));
+-      this.definedFunctionArities.set(functionId, { in: func.parameters.length, out: func.returnTypes?.length ?? 0 });
++      const borrow = this.compilerOptions.borrowSpec?.get(func.name);
++      const owned = func.parameters.length - (borrow?.offsets.size ?? 0) + (borrow?.runtime ? 1 : 0);
++      this.definedFunctionArities.set(functionId, {
++        in: owned,
++        out: func.returnTypes?.length ?? 0,
++        ...(borrow !== undefined ? { window: owned + (borrow.runtime ? 0 : borrow.regionSize) } : {}),
++        ...(borrow?.runtime ? { dynamic: true } : {}),
++      });
+       const locationData = { location: func.location, positionHint: PositionHint.START };
+       this.emit(scriptToBytecode(compiledResult.script), locationData); // <function_body_bytes>
+       this.emit(encodeInt(BigInt(functionId)), locationData); // <function_identifier>
+@@ -300,13 +323,44 @@ export default class GenerateTargetTraversal extends AstTraversal {
+     bodyTraversal.currentFunction = node;
+     bodyTraversal.constructorParameterCount = 0;
+ 
++    const probe = this.compilerOptions.borrowProbe;
++    if (probe !== undefined) {
++      const assigned = new AssignedNameCollector();
++      assigned.visit(node.body);
++      probe.eligible.set(node.name, new Set(node.parameters.flatMap((parameter, j) => (
++        parameter.symbol!.isUnused() || assigned.names.has(parameter.name) ? [] : [j]
++      ))));
++    }
++
+     // Seed the stack with the first parameter on top, matching the right-to-left argument staging
+-    // at call sites (see stageUserFunctionArguments)
+-    node.parameters.forEach((parameter) => bodyTraversal.visit(parameter));
+-    bodyTraversal.dropUnusedParameters(node.parameters);
++    // at call sites (see stageUserFunctionArguments). Borrowed parameters live in the region below
++    // the owned ones (see borrowing.ts).
++    const borrow = this.compilerOptions.borrowSpec?.get(node.name);
++    const ownedParameters = node.parameters.filter((_, j) => !borrow?.offsets.has(j));
++    if (borrow?.runtime) bodyTraversal.pushToStack(RUNTIME_BASE_NAME, true);
++    ownedParameters.forEach((parameter) => bodyTraversal.visit(parameter));
++    if (borrow?.runtime) {
++      bodyTraversal.runtimeEntryHeight = bodyTraversal.stack.length;
++      borrow.offsets.forEach((offset, j) => bodyTraversal.runtimeBorrow.set(node.parameters[j].name, offset));
++    } else if (borrow !== undefined) {
++      for (let offset = 0; offset < borrow.regionSize; offset += 1) {
++        bodyTraversal.pushToStack(regionSlotName(offset), true);
++      }
++      borrow.offsets.forEach((offset, j) => bodyTraversal.borrowAlias.set(node.parameters[j].name, regionSlotName(offset)));
++    }
++    bodyTraversal.dropUnusedParameters(ownedParameters);
+ 
+     bodyTraversal.visit(node.body);
++    if (borrow !== undefined && !borrow.runtime) {
++      // The region is the bottom of the frame and is never touched; leave it out of the cleanup
++      const region = bodyTraversal.stack.slice(bodyTraversal.stack.length - borrow.regionSize);
++      if (!region.every((name, offset) => name === regionSlotName(offset))) {
++        throw new Error(`Internal error: borrow region of ${node.name} was disturbed`);
++      }
++      bodyTraversal.stack.length -= borrow.regionSize;
++    }
+     bodyTraversal.cleanGlobalFunctionStack(node);
++    bodyTraversal.flushBorrowProbe();
+     bodyTraversal.mergeInlinedDebugInfo();
+ 
+     const optimisedResult = optimiseBytecode(
+@@ -762,6 +816,7 @@ export default class GenerateTargetTraversal extends AstTraversal {
+       finalStackUsage: { ...this.finalStackUsage },
+       inlineRanges: [...this.inlineRanges],
+       consumedReads: new Set(this.consumedReads),
++      probeRecords: [...this.probeRecords],
+     };
+   }
+ 
+@@ -775,6 +830,7 @@ export default class GenerateTargetTraversal extends AstTraversal {
+     this.finalStackUsage = { ...state.finalStackUsage };
+     this.inlineRanges = [...state.inlineRanges];
+     this.consumedReads = new Set(state.consumedReads);
++    this.probeRecords = [...state.probeRecords];
+   }
+ 
+   // The cost of the code emitted since startIndex, after peephole optimisation, ordered by the optimisation
+@@ -868,7 +924,7 @@ export default class GenerateTargetTraversal extends AstTraversal {
+         const symbol = parameter.symbol!;
+ 
+         // If the variable is not on the stack, then we add the final stack usage to the console log
+-        const stackIndex = this.getStackIndex(parameter.name, true);
++        const stackIndex = this.getStackIndex(this.slotOf(parameter.name), true);
+         if (stackIndex === -1) {
+           if (!this.finalStackUsage[parameter.name]) {
+             throw new Error(`Expected variable '${parameter.name}' does not exist on the stack or in final stack usage`);
+@@ -1179,8 +1235,18 @@ export default class GenerateTargetTraversal extends AstTraversal {
+ 
+     const symbol = node.identifier.symbol!;
+ 
+-    if (symbol.definition instanceof FunctionDefinitionNode) {
++    const borrow = symbol.definition instanceof FunctionDefinitionNode
++      ? this.compilerOptions.borrowSpec?.get(node.identifier.name) : undefined;
++    let stagedCount = node.parameters.length;
++    let fallbackRegion = 0;
++    if (borrow !== undefined) {
++      ({ stagedCount, fallbackRegion } = this.stageBorrowingCall(
++        node, borrow.offsets, borrow.regionSize, borrow.runtime === true,
++      ));
++    } else if (symbol.definition instanceof FunctionDefinitionNode) {
++      const stackBefore = [...this.stack];
+       this.stageUserFunctionArguments(node);
++      this.recordBorrowProbe(node, stackBefore);
+     } else {
+       node.parameters = this.visitList(node.parameters);
+     }
+@@ -1194,7 +1260,7 @@ export default class GenerateTargetTraversal extends AstTraversal {
+       this.inlineRanges.push({ startIp, endIp, frame: symbol.inlinedFrame, line: node.location.start.line });
+     }
+ 
+-    this.popFromStack(node.parameters.length);
++    this.popFromStack(stagedCount);
+ 
+     // The call leaves one value per declared return type (none for a void function); a multi-return
+     // function's values (a TupleType) are subsequently bound by visitTupleAssignment.
+@@ -1202,6 +1268,19 @@ export default class GenerateTargetTraversal extends AstTraversal {
+       : symbol.type instanceof TupleType ? symbol.type.elementTypes.length : 1;
+     for (let i = 0; i < returnValueCount; i += 1) this.pushToStack('(value)');
+ 
++    // A fallback borrowing call staged its own region below the owned arguments; drop it again
++    for (let i = 0; i < fallbackRegion; i += 1) {
++      const locationData = { location: node.location, positionHint: PositionHint.END };
++      if (returnValueCount === 0) {
++        this.emit(Op.OP_DROP, locationData);
++      } else {
++        this.emit(encodeInt(BigInt(returnValueCount)), locationData);
++        this.emit(Op.OP_ROLL, locationData);
++        this.emit(Op.OP_DROP, locationData);
++      }
++      this.removeFromStack(returnValueCount);
++    }
++
+     return node;
+   }
+ 
+@@ -1211,7 +1290,9 @@ export default class GenerateTargetTraversal extends AstTraversal {
+   // costs zero staging instructions. Because reversed emission breaks the textual final-use order,
+   // a variable is only allowed to ROLL when it appears exactly once across the whole argument tree
+   // (see isOpRoll); everything else stays a PICK.
+-  private stageUserFunctionArguments(node: FunctionCallNode): void {
++  // `sequence` lists the emission order (parameter indices, or 'gap' for a zero filler); by default
++  // all parameters right-to-left
++  private stageUserFunctionArguments(node: FunctionCallNode, sequence?: Array<number | 'gap'>): void {
+     const isOutermostCall = this.userCallArgDepth === 0;
+     if (isOutermostCall) {
+       const counter = new ArgIdentifierCounter();
+@@ -1219,15 +1300,105 @@ export default class GenerateTargetTraversal extends AstTraversal {
+       this.callArgNameCounts = counter.counts;
+     }
+ 
++    const order = sequence ?? node.parameters.map((_, i) => node.parameters.length - 1 - i);
+     this.userCallArgDepth += 1;
+-    for (let i = node.parameters.length - 1; i >= 0; i -= 1) {
++    order.forEach((i) => {
++      if (i === 'gap') {
++        this.emit(encodeInt(0n), { location: node.location, positionHint: PositionHint.START });
++        this.pushToStack('(value)');
++        return;
++      }
+       node.parameters[i] = this.visit(node.parameters[i]);
+-    }
++    });
+     this.userCallArgDepth -= 1;
+ 
+     if (isOutermostCall) this.callArgNameCounts = null;
+   }
+ 
++  private slotOf(name: string): string {
++    return this.borrowAlias.get(name) ?? name;
++  }
++
++  // Probe (borrowArgs spec search): after a plain call's argument staging, record for every
++  // argument that is a variable still on the stack the region offset it would have if borrowed
++  // With borrowFinalUse, a variable passed on its final use is a candidate too (it is then left in
++  // place, dead, for the caller to drop later); offsets are then taken from the pre-staging layout,
++  // assuming no argument variable gets rolled out from above it (validated by the check compile).
++  private recordBorrowProbe(node: FunctionCallNode, stackBefore: string[]): void {
++    const probe = this.compilerOptions.borrowProbe;
++    if (probe === undefined) return;
++    const n = node.parameters.length;
++    const finalUse = this.compilerOptions.borrowFinalUse === true;
++    const offsets = node.parameters.map((parameter) => {
++      if (!(parameter instanceof IdentifierNode)) return null;
++      if (finalUse) {
++        const before = stackBefore.indexOf(this.slotOf(parameter.name));
++        return before < 0 ? null : before;
++      }
++      const index = this.stack.indexOf(this.slotOf(parameter.name));
++      return index < 0 ? null : index - n;
++    });
++    this.probeRecords.push({ kind: 'site', callee: node.identifier.name, offsets });
++  }
++
++  private flushBorrowProbe(): void {
++    const probe = this.compilerOptions.borrowProbe;
++    if (probe === undefined) return;
++    this.probeRecords.forEach((record) => {
++      if (record.kind === 'site') {
++        if (!probe.sites.has(record.callee)) probe.sites.set(record.callee, []);
++        probe.sites.get(record.callee)!.push(record.offsets);
++      } else if (record.kind === 'fallback') {
++        probe.fallbacks.add(record.callee);
++      } else {
++        probe.inPlace.set(record.callee, (probe.inPlace.get(record.callee) ?? 0) + 1);
++      }
++    });
++    this.probeRecords = [];
++  }
++
++  // Stage a call to a borrowing callee: in place when every borrowed argument is a variable already
++  // at its region slot once the owned arguments are staged; otherwise stage a fresh region (borrowed
++  // arguments + zero gap fillers, deepest slot first) below the owned arguments, which the caller
++  // drops again after the call.
++  private stageBorrowingCall(
++    node: FunctionCallNode, offsets: Map<number, number>, regionSize: number, runtime: boolean,
++  ): { stagedCount: number; fallbackRegion: number } {
++    const n = node.parameters.length;
++    const owned = node.parameters.map((_, i) => n - 1 - i).filter((i) => !offsets.has(i));
++    const start = this.saveState();
++    this.stageUserFunctionArguments(node, owned);
++    const bases = [...offsets].map(([j, offset]) => {
++      const argument = node.parameters[j];
++      if (!(argument instanceof IdentifierNode)) return -1;
++      const index = this.stack.indexOf(this.slotOf(argument.name));
++      return index < 0 ? -1 : index - offset;
++    });
++    const inPlace = runtime
++      ? bases.every((base) => base === bases[0] && base >= owned.length)
++      : bases.every((base) => base === owned.length);
++    const name = node.identifier.name;
++    const pushBase = (base: number): void => {
++      // the depth of region slot 0 once this base argument itself is on the stack
++      this.emit(encodeInt(BigInt(base + 1)), { location: node.location, positionHint: PositionHint.START });
++      this.pushToStack('(value)');
++    };
++    if (inPlace) {
++      this.probeRecords.push({ kind: 'inPlace', callee: name });
++      if (runtime) pushBase(bases[0]);
++      return { stagedCount: owned.length + (runtime ? 1 : 0), fallbackRegion: 0 };
++    }
++
++    this.restoreState(start);
++    this.probeRecords.push({ kind: 'fallback', callee: name });
++    const byOffset = new Map([...offsets].map(([j, offset]) => [offset, j]));
++    const region: Array<number | 'gap'> = [];
++    for (let offset = regionSize - 1; offset >= 0; offset -= 1) region.push(byOffset.get(offset) ?? 'gap');
++    this.stageUserFunctionArguments(node, [...region, ...owned]);
++    if (runtime) pushBase(owned.length);
++    return { stagedCount: owned.length + (runtime ? 1 : 0), fallbackRegion: regionSize };
++  }
++
+   visitMultiSig(node: FunctionCallNode): Node {
+     this.emit(encodeBool(false), { location: node.location, positionHint: PositionHint.START });
+     this.pushToStack('(value)');
+@@ -1421,7 +1592,22 @@ export default class GenerateTargetTraversal extends AstTraversal {
+   }
+ 
+   visitIdentifier(node: IdentifierNode): Node {
+-    const stackIndex = this.getStackIndex(node.name);
++    const runtimeOffset = this.runtimeBorrow.get(node.name);
++    if (runtimeOffset !== undefined) {
++      // depth of region slot o = base + (height - entry height) + o, read after copying the base
++      const locationData = { location: node.location, positionHint: PositionHint.START };
++      const correction = this.stack.length - this.runtimeEntryHeight + runtimeOffset;
++      this.emit(encodeInt(BigInt(this.getStackIndex(RUNTIME_BASE_NAME))), locationData);
++      this.emit(Op.OP_PICK, locationData);
++      if (correction !== 0) {
++        this.emit(encodeInt(BigInt(correction)), locationData);
++        this.emit(Op.OP_ADD, locationData);
++      }
++      this.emit(Op.OP_PICK, locationData);
++      this.pushToStack('(value)');
++      return node;
++    }
++    const stackIndex = this.getStackIndex(this.slotOf(node.name));
+     this.emit(encodeInt(BigInt(stackIndex)), { location: node.location, positionHint: PositionHint.START });
+ 
+     // If the final use is inside an if-statement, we still OP_PICK it
+@@ -1447,6 +1633,8 @@ export default class GenerateTargetTraversal extends AstTraversal {
+   }
+ 
+   isOpRoll(node: IdentifierNode): boolean {
++    // Borrowed parameters belong to the caller: always read, never consumed
++    if (this.borrowAlias.has(node.name) || this.runtimeBorrow.has(node.name)) return false;
+     if (this.consumedReads.has(node)) {
+       return this.userCallArgDepth === 0 || this.callArgNameCounts?.get(node.name) === 1;
+     }
+@@ -1514,6 +1702,20 @@ class IdentifierReadCollector extends AstTraversal {
+   }
+ }
+ 
++class AssignedNameCollector extends AstTraversal {
++  names: Set<string> = new Set();
++
++  visitAssign(node: AssignNode): Node {
++    this.names.add(node.identifier.name);
++    return super.visitAssign(node);
++  }
++
++  visitTupleAssignment(node: TupleAssignmentNode): Node {
++    node.targets.filter((target) => target.isReassignment).forEach((target) => this.names.add(target.identifier.name));
++    return super.visitTupleAssignment(node);
++  }
++}
++
+ class ReassignmentFinder extends AstTraversal {
+   found = false;
+ 
+diff --git a/packages/cashc/src/stack-rescheduling.ts b/packages/cashc/src/stack-rescheduling.ts
+index 06cfd1b2..da29e676 100644
+--- a/packages/cashc/src/stack-rescheduling.ts
++++ b/packages/cashc/src/stack-rescheduling.ts
+@@ -87,15 +87,26 @@ import {
+   sourceMapToLocationData,
+ } from '@cashscript/utils';
+ 
+-export interface FunctionArity { in: number; out: number }
++// `window` (borrowing callees, see generation/borrowing.ts): the callee also reads, without
++// consuming, the stack slots below its `in` arguments down to depth `window`. An invoke of such a
++// callee is a block boundary in its callers (the region layout must stay exactly as emitted), and
++// its body is decompiled over all `window` entry slots.
++// `dynamic`: runtime-depth borrowing body (dynamic PICK depths, never re-emitted); its callees keep
++// their identity layout so that its original ops stay valid.
++export interface FunctionArity { in: number; out: number; window?: number; dynamic?: boolean }
+ 
+ export interface RescheduleOptions {
+   arities: Map<number, FunctionArity>; // per OP_DEFINE'd functionId
+   mainInArity: number; // spend parameters + constructor parameters
+   objective: 'size' | 'opcost';
+   constructorParamLength: number;
++  // keep exit slots that are untouched entry slots in place instead of re-assembling them
++  passThroughBottom?: boolean;
+ }
+ 
++// set per pass invocation from RescheduleOptions.passThroughBottom
++let passThroughDefault = false;
++
+ export interface RescheduleOutcome {
+   result: OptimiseBytecodeResult;
+   frames: DebugFrame[];
+@@ -242,6 +253,22 @@ function decompile(script: Script, arities: Map<number, FunctionArity>, inArity:
+     const el = script[i];
+     const op = elOpcode(el);
+ 
++    if (op === Op.OP_INVOKE) {
++      const top = main[main.length - 1];
++      const id = top !== undefined && top.k === 'const' ? Number(decodeInt(top.data)) : undefined;
++      const arity = id !== undefined ? arities.get(id) : undefined;
++      if (arity?.window !== undefined) {
++        if (main.length < arity.window + 1) throw new Error('borrowing invoke past stack bottom');
++        closeBlock(i);
++        main.length -= 1 + arity.in;
++        for (let j = 0; j < arity.out; j += 1) main.push({ k: 'const', data: Uint8Array.of() });
++        items.push({ ctrl: op, index: i });
++        rawStart = i + 1;
++        beginBlock();
++        continue;
++      }
++    }
++
+     if (CTRL.has(op)) {
+       closeBlock(i);
+       if (op === Op.OP_IF || op === Op.OP_NOTIF) {
+@@ -444,6 +471,7 @@ function computeNode(s: EmitState, node: DagNode, exitNeed: Map<string, number>,
+ interface EmitOptions {
+   entrySeed?: string[]; // stack labels at block entry, bottom -> top (defaults to m0..mN-1)
+   calleePerms?: Map<number, number[]>;
++  passThroughBottom?: boolean;
+ }
+ 
+ const NO_PERMS: Map<number, number[]> = new Map();
+@@ -516,27 +544,38 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+     (nd) => s.remaining.has(nd.id) && inputNodeIds(nd).every((id) => !s.remaining.has(id)),
+   );
+ 
++  // Pass-through bottom (borrowArgs): exit slots that are the untouched entry slots at the same
++  // positions stay where they are. They are never consumed while computing (their exit use keeps
++  // them alive, so every read copies), so the exit only has to be assembled above them.
++  let fixed = 0;
++  if (options.passThroughBottom) {
++    while (
++      fixed < exit.length && fixed < n && exit[fixed].k === 'in' && (exit[fixed] as { i: number }).i === fixed
++      && (options.entrySeed?.[fixed] ?? `m${fixed}`) === `m${fixed}`
++    ) fixed += 1;
++  }
++
+   // assemble the exit layout on top (exit-main ++ reverse(exit-alt) unless alt passes
+   // through), clean buried junk, and restore the altstack
+   const finish = (s: EmitState): void => {
+     const need = new Map(exitNeed);
+-    const desired = altPass ? [...exit] : [...exit, ...[...exitAlt].reverse()];
++    const desired = (altPass ? [...exit] : [...exit, ...[...exitAlt].reverse()]).slice(fixed);
+     const desiredKeys = desired.map((r) => (r.k === 'const' ? undefined : keyOf(r)));
+-    const inPlace = s.stk.length >= desired.length
++    const inPlace = s.stk.length >= fixed + desired.length
+       && desiredKeys.every((dk, i) => dk !== undefined && s.stk[s.stk.length - desired.length + i] === dk);
+     if (!inPlace) desired.forEach((r) => bringRef(s, r, false, need));
+ 
+     const K = desired.length;
+-    const junk = s.stk.length - K;
++    const junk = s.stk.length - fixed - K;
+     if (junk > 0) {
+       if (2 * K + junk <= 4 * junk) {
+         for (let i = 0; i < K; i += 1) appendOp(s, Op.OP_TOALTSTACK);
+         for (let i = 0; i < junk; i += 1) appendOp(s, Op.OP_DROP);
+         for (let i = 0; i < K; i += 1) appendOp(s, Op.OP_FROMALTSTACK);
+-        s.stk = s.stk.slice(s.stk.length - K);
++        s.stk = [...s.stk.slice(0, fixed), ...s.stk.slice(s.stk.length - K)];
+       } else {
+         for (let i = 0; i < junk; i += 1) {
+-          pushNum(s, s.stk.length - 1); appendOp(s, Op.OP_ROLL); appendOp(s, Op.OP_DROP); s.stk.splice(0, 1);
++          pushNum(s, s.stk.length - 1 - fixed); appendOp(s, Op.OP_ROLL); appendOp(s, Op.OP_DROP); s.stk.splice(fixed, 1);
+         }
+       }
+     }
+@@ -679,6 +718,7 @@ interface RecompiledScript {
+ interface RecompileOptions {
+   entryPerm?: number[]; // permuted entry layout of the FIRST block (bottom -> top holds slot perm[j])
+   calleePerms?: Map<number, number[]>;
++  passThroughBottom?: boolean;
+ }
+ 
+ const isIdentityPerm = (perm: number[] | undefined): boolean => perm === undefined || perm.every((v, i) => v === i);
+@@ -717,6 +757,7 @@ function recompileScript(
+   options: RecompileOptions = {},
+ ): RecompiledScript {
+   const calleePerms = options.calleePerms ?? NO_PERMS;
++  const passThroughBottom = options.passThroughBottom ?? passThroughDefault;
+   const items = decompile(script, arities, inArity);
+   const out: Script = [];
+   const mapping: ItemMapping[] = [];
+@@ -743,7 +784,9 @@ function recompileScript(
+     if (dead && !rawValid) throw new Error('dead computation in a block that cannot keep its original ops');
+     // per-block min(original, rescheduled): both reproduce the block's entry->exit
+     // transform AND its boundary layout, so they compose freely
+-    const mine = dead ? undefined : peephole(emitBlock(block, strategy, { entrySeed, calleePerms }));
++    const mine = dead ? undefined : peephole(emitBlock(block, strategy, {
++      entrySeed, calleePerms, passThroughBottom,
++    }));
+     const useMine = mine !== undefined
+       && (!rawValid || scriptCost(mine, objective) < scriptCost(block.rawOps, objective));
+     const chosen = useMine ? mine! : block.rawOps;
+@@ -988,9 +1031,12 @@ function rescheduleBodies(
+   const perms = new Map<number, number[]>();
+   const strategies: Strategy[] = layouts ? [...BODY_STRATEGIES, 'beam'] : BODY_STRATEGIES;
+   const processing = layouts ? calleeFirstOrder(d) : d.order;
++  const pinned = new Set(d.order.filter((id) => arities.get(id)?.dynamic).flatMap((id) => bodyInvokes(d.bodies.get(id)!)));
+ 
+   processing.forEach((id) => {
+-    const arity = arities.get(id);
++    const declared = arities.get(id);
++    // a borrowing body is decompiled and differentially tested over its whole window
++    const arity = declared?.window !== undefined ? { in: declared.window, out: declared.out } : declared;
+     const original = d.bodies.get(id)!;
+     const calleesPermuted = bodyInvokes(original).some((callee) => perms.has(callee));
+     if (arity === undefined) {
+@@ -1011,7 +1057,8 @@ function rescheduleBodies(
+       bestCost = objective === 'opcost' ? measureBody(d, overrides, id, arity, undefined) : calculateBytesize(original);
+     }
+ 
+-    const candidatesPerms = layouts ? layoutCandidates(original, arities, arity.in) : [undefined];
++    const candidatesPerms = layouts && declared?.window === undefined && !pinned.has(id)
++      ? layoutCandidates(original, arities, arity.in) : [undefined];
+     candidatesPerms.forEach((perm) => {
+       const identity = isIdentityPerm(perm as number[] | undefined);
+       strategies.forEach((strategy) => {
+@@ -1020,10 +1067,18 @@ function rescheduleBodies(
+           candidate = reoptimiseBody(recompileScript(original, arities, arity.in, strategy, objective, {
+             entryPerm: perm as number[] | undefined, calleePerms: perms,
+           }).script);
+-        } catch { return; }
++        } catch (e) {
++          if (process.env.CASHC_DEBUG_BORROW_BODY !== undefined && declared?.window !== undefined) {
++            console.error(`[borrow-body] ${id} ${strategy} threw: ${(e as Error).message}`); // eslint-disable-line no-console
++          }
++          return;
++        }
+         const cost = bodyCost(candidate, identity ? undefined : (perm as number[]));
+         const effective = identity ? cost : cost * LAYOUT_HYSTERESIS;
+         const effectivePerm = identity ? undefined : (perm as number[]);
++        if (process.env.CASHC_DEBUG_BORROW_BODY !== undefined && declared?.window !== undefined) {
++          console.error(`[borrow-body] ${id} ${strategy} cost ${effective} vs best ${bestCost} equiv ${bodyEquiv(d, overrides, id, candidate, arity, effectivePerm)}`); // eslint-disable-line no-console
++        }
+         if (effective < bestCost && bodyEquiv(d, overrides, id, candidate, arity, effectivePerm)) {
+           best = candidate;
+           bestPerm = identity ? undefined : (perm as number[]);
+@@ -1096,6 +1151,7 @@ export function applyStackRescheduling(
+   options: RescheduleOptions,
+ ): RescheduleOutcome {
+   const { arities, objective, constructorParamLength } = options;
++  passThroughDefault = options.passThroughBottom ?? false;
+   const d = dissect(optimised.script);
+ 
+   // 1. bodies (skipped for a body with console.log entries — wholesale reordering cannot
+diff --git a/packages/cashc/src/generation/borrowing.ts b/packages/cashc/src/generation/borrowing.ts
+new file mode 100644
+index 00000000..6b19efdc
+--- /dev/null
++++ b/packages/cashc/src/generation/borrowing.ts
+@@ -0,0 +1,131 @@
++// Borrow-by-depth argument passing (experimental, internal option `borrowArgs`).
++//
++// A user function F may BORROW some of its read-only parameters: instead of the caller copying the
++// argument value to the top of the stack before the call, the callee reads it in place with
++// `<depth> OP_PICK`. The convention is static per function: F's owned (non-borrowed) parameters are
++// staged on top as usual, and below them sits a REGION of `regionSize` stack slots that F reads but
++// never modifies or drops; borrowed parameter j lives at region offset `offsets.get(j)` (offset 0 is
++// the slot directly below the owned arguments). Region slots that hold no borrowed parameter are gaps
++// (unrelated caller values the callee ignores).
++//
++// A call site is emitted IN PLACE when, after staging the owned arguments, every borrowed argument
++// is a variable that already sits at its region slot; otherwise the call site falls back to staging
++// a fresh region (copies + gap fillers), invoking, and dropping the region again. The spec is chosen
++// from a probe compile (offsets observed at every call site must agree) and pruned until no call site
++// needs the fallback (see compileImpl).
++//
++// The stack rescheduler treats an OP_INVOKE of a borrowing function as a block boundary (the region
++// layout must be exactly the one codegen produced), and decompiles the callee body over its whole
++// window (owned arguments + region).
++
++export interface BorrowSpecEntry {
++  offsets: Map<number, number>; // parameter index -> region offset
++  regionSize: number;
++  // Runtime-depth variant: the region may sit at a different depth at every call site. The caller
++  // passes the depth of region slot 0 (at callee entry) as an extra top-most argument, and the callee
++  // reads borrowed parameter j with `<base> OP_PICK <c> OP_ADD OP_PICK`.
++  runtime?: boolean;
++}
++
++export const RUNTIME_BASE_NAME = '$borrowBase';
++
++export type BorrowSpec = Map<string, BorrowSpecEntry>;
++
++export interface BorrowProbe {
++  // per callee: for every emitted call site, per parameter the region offset its argument would have
++  // if borrowed (a variable still on the stack after argument staging), or null
++  sites: Map<string, Array<Array<number | null>>>;
++  // per function: indices of parameters that are used and never reassigned in its body
++  eligible: Map<string, Set<number>>;
++  // callees that needed the fallback staging at some call site
++  fallbacks: Set<string>;
++  inPlace: Map<string, number>;
++}
++
++export const newBorrowProbe = (): BorrowProbe => ({
++  sites: new Map(), eligible: new Map(), fallbacks: new Set(), inPlace: new Map(),
++});
++
++export const regionSlotName = (offset: number): string => `$borrow#${offset}`;
++
++// Static variant: borrow parameter j of F when every observed call site passes, for j, a variable
++// that survives the call at the same region offset. Two parameters may not share a slot.
++export function computeBorrowSpec(probe: BorrowProbe, only?: Set<string>): BorrowSpec {
++  const spec: BorrowSpec = new Map();
++  probe.sites.forEach((sites, callee) => {
++    if (only !== undefined && !only.has(callee)) return;
++    const eligible = probe.eligible.get(callee);
++    if (eligible === undefined || sites.length === 0) return;
++    const offsets = new Map<number, number>();
++    const used = new Set<number>();
++    const n = sites[0].length;
++    for (let j = 0; j < n; j += 1) {
++      if (!eligible.has(j)) continue;
++      const first = sites[0][j];
++      if (first === null || first === undefined) continue;
++      if (!sites.every((site) => site[j] === first)) continue;
++      if (used.has(first)) continue;
++      used.add(first);
++      offsets.set(j, first);
++    }
++    if (offsets.size === 0) return;
++    spec.set(callee, { offsets, regionSize: Math.max(...offsets.values()) + 1 });
++  });
++  return spec;
++}
++
++// Runtime-depth variant: only the RELATIVE offsets of the borrowed parameters must agree across call
++// sites (the base is passed at run time). The first eligible parameter that is a surviving variable
++// at every site is the reference; every other such parameter whose offset difference to it is the
++// same at all sites joins the group.
++export function computeRuntimeBorrowSpec(probe: BorrowProbe, names: Set<string>): BorrowSpec {
++  const spec: BorrowSpec = new Map();
++  probe.sites.forEach((sites, callee) => {
++    if (!names.has(callee)) return;
++    const eligible = probe.eligible.get(callee);
++    if (eligible === undefined || sites.length === 0) return;
++    const n = sites[0].length;
++    const always = [...Array(n).keys()].filter((j) => eligible.has(j) && sites.every((site) => site[j] !== null));
++    if (always.length === 0) return;
++    const reference = always[0];
++    const relative = new Map<number, number>();
++    const used = new Set<number>();
++    always.forEach((j) => {
++      const delta = sites[0][j]! - sites[0][reference]!;
++      if (!sites.every((site) => site[j]! - site[reference]! === delta)) return;
++      if (used.has(delta)) return;
++      used.add(delta);
++      relative.set(j, delta);
++    });
++    const min = Math.min(...relative.values());
++    const offsets = new Map([...relative].map(([j, delta]) => [j, delta - min]));
++    spec.set(callee, { offsets, regionSize: Math.max(...offsets.values()) + 1, runtime: true });
++  });
++  return spec;
++}
++
++// Runtime-depth experiment with an explicit parameter group: the relative layout is the most common
++// one among the call sites that pass every group parameter as a variable; other sites fall back.
++export function computeRuntimeGroupSpec(probe: BorrowProbe, groups: Record<string, number[]>): BorrowSpec {
++  const spec: BorrowSpec = new Map();
++  Object.entries(groups).forEach(([callee, group]) => {
++    const sites = probe.sites.get(callee) ?? [];
++    const eligible = probe.eligible.get(callee);
++    const members = group.filter((j) => eligible?.has(j));
++    if (members.length === 0) return;
++    const patterns = new Map<string, number>();
++    sites.forEach((site) => {
++      if (!members.every((j) => site[j] !== null)) return;
++      const key = members.map((j) => site[j]! - site[members[0]]!).join(',');
++      patterns.set(key, (patterns.get(key) ?? 0) + 1);
++    });
++    const best = [...patterns].sort((a, b) => b[1] - a[1])[0];
++    if (best === undefined) return;
++    const deltas = best[0].split(',').map(Number);
++    if (new Set(deltas).size !== deltas.length) return;
++    const min = Math.min(...deltas);
++    const offsets = new Map(members.map((j, k) => [j, deltas[k] - min]));
++    spec.set(callee, { offsets, regionSize: Math.max(...offsets.values()) + 1, runtime: true });
++  });
++  return spec;
++}

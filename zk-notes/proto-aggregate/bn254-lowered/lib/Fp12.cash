@@ -1,0 +1,117 @@
+pragma cashscript ^0.14.0;
+
+// BN254 Fp12 = Fp6[w]/(w^2 - v), gamma = v = Fp6 non-residue (noble basis).
+// An Fp12 element is (c0, c1) with each ci an Fp6 (= 6 ints) -> 12 ints in noble serialization order.
+// This file covers mul / sqr / conjugate; Frobenius maps + inverse are appended for the higher
+// layers (final exponentiation). Builds on Fp6.cash.
+import "./Fp6.cash";
+
+
+
+// sparse Fp12 multiply f * (o0, 0, 0, o3, o4, 0) — the Miller-loop line application (mul034).
+function mul034(int F_c0_c0_c0, int F_c0_c0_c1, int F_c0_c1_c0, int F_c0_c1_c1, int F_c0_c2_c0, int F_c0_c2_c1, int F_c1_c0_c0, int F_c1_c0_c1, int F_c1_c1_c0, int F_c1_c1_c1, int F_c1_c2_c0, int F_c1_c2_c1, int o0_c0, int o0_c1, int o3_c0, int o3_c1, int o4_c0, int o4_c1) returns (int, int, int, int, int, int, int, int, int, int, int, int) {
+    (int A0_c0, int A0_c1) = fp2Mul(F_c0_c0_c0, F_c0_c0_c1, o0_c0, o0_c1);
+    (int A1_c0, int A1_c1) = fp2Mul(F_c0_c1_c0, F_c0_c1_c1, o0_c0, o0_c1);
+    (int A2_c0, int A2_c1) = fp2Mul(F_c0_c2_c0, F_c0_c2_c1, o0_c0, o0_c1);
+    (int B_c0_c0, int B_c0_c1, int B_c1_c0, int B_c1_c1, int B_c2_c0, int B_c2_c1) = fp6Mul01(F_c1_c0_c0, F_c1_c0_c1, F_c1_c1_c0, F_c1_c1_c1, F_c1_c2_c0, F_c1_c2_c1, o3_c0, o3_c1, o4_c0, o4_c1);
+    (int S_c0_c0, int S_c0_c1, int S_c1_c0, int S_c1_c1, int S_c2_c0, int S_c2_c1) = fp6Add(F_c0_c0_c0, F_c0_c0_c1, F_c0_c1_c0, F_c0_c1_c1, F_c0_c2_c0, F_c0_c2_c1, F_c1_c0_c0, F_c1_c0_c1, F_c1_c1_c0, F_c1_c1_c1, F_c1_c2_c0, F_c1_c2_c1);
+    (int q_c0, int q_c1) = fp2Add(o0_c0, o0_c1, o3_c0, o3_c1);
+    (int G_c0_c0, int G_c0_c1, int G_c1_c0, int G_c1_c1, int G_c2_c0, int G_c2_c1) = fp6Mul01(S_c0_c0, S_c0_c1, S_c1_c0, S_c1_c1, S_c2_c0, S_c2_c1, q_c0, q_c1, o4_c0, o4_c1);
+    (int VB_c0_c0, int VB_c0_c1, int VB_c1_c0, int VB_c1_c1, int VB_c2_c0, int VB_c2_c1) = fp6MulByV(B_c0_c0, B_c0_c1, B_c1_c0, B_c1_c1, B_c2_c0, B_c2_c1);
+    (int C0_c0_c0, int C0_c0_c1, int C0_c1_c0, int C0_c1_c1, int C0_c2_c0, int C0_c2_c1) = fp6Add(VB_c0_c0, VB_c0_c1, VB_c1_c0, VB_c1_c1, VB_c2_c0, VB_c2_c1, A0_c0, A0_c1, A1_c0, A1_c1, A2_c0, A2_c1);
+    (int AB_c0_c0, int AB_c0_c1, int AB_c1_c0, int AB_c1_c1, int AB_c2_c0, int AB_c2_c1) = fp6Add(A0_c0, A0_c1, A1_c0, A1_c1, A2_c0, A2_c1, B_c0_c0, B_c0_c1, B_c1_c0, B_c1_c1, B_c2_c0, B_c2_c1);
+    (int C1_c0_c0, int C1_c0_c1, int C1_c1_c0, int C1_c1_c1, int C1_c2_c0, int C1_c2_c1) = fp6Sub(G_c0_c0, G_c0_c1, G_c1_c0, G_c1_c1, G_c2_c0, G_c2_c1, AB_c0_c0, AB_c0_c1, AB_c1_c0, AB_c1_c1, AB_c2_c0, AB_c2_c1);
+    return C0_c0_c0, C0_c0_c1, C0_c1_c0, C0_c1_c1, C0_c2_c0, C0_c2_c1, C1_c0_c0, C1_c0_c1, C1_c1_c0, C1_c1_c1, C1_c2_c0, C1_c2_c1;
+}
+// (a0 + a1 w)(b0 + b1 w) = (a0 b0 + v a1 b1) + ((a0+a1)(b0+b1) - a0 b0 - a1 b1) w
+function fp12Mul(int a_c0_c0_c0, int a_c0_c0_c1, int a_c0_c1_c0, int a_c0_c1_c1, int a_c0_c2_c0, int a_c0_c2_c1, int a_c1_c0_c0, int a_c1_c0_c1, int a_c1_c1_c0, int a_c1_c1_c1, int a_c1_c2_c0, int a_c1_c2_c1, int b_c0_c0_c0, int b_c0_c0_c1, int b_c0_c1_c0, int b_c0_c1_c1, int b_c0_c2_c0, int b_c0_c2_c1, int b_c1_c0_c0, int b_c1_c0_c1, int b_c1_c1_c0, int b_c1_c1_c1, int b_c1_c2_c0, int b_c1_c2_c1) returns (int, int, int, int, int, int, int, int, int, int, int, int) {
+    (int t0_c0_c0, int t0_c0_c1, int t0_c1_c0, int t0_c1_c1, int t0_c2_c0, int t0_c2_c1) = fp6Mul(a_c0_c0_c0, a_c0_c0_c1, a_c0_c1_c0, a_c0_c1_c1, a_c0_c2_c0, a_c0_c2_c1, b_c0_c0_c0, b_c0_c0_c1, b_c0_c1_c0, b_c0_c1_c1, b_c0_c2_c0, b_c0_c2_c1);
+    (int t1_c0_c0, int t1_c0_c1, int t1_c1_c0, int t1_c1_c1, int t1_c2_c0, int t1_c2_c1) = fp6Mul(a_c1_c0_c0, a_c1_c0_c1, a_c1_c1_c0, a_c1_c1_c1, a_c1_c2_c0, a_c1_c2_c1, b_c1_c0_c0, b_c1_c0_c1, b_c1_c1_c0, b_c1_c1_c1, b_c1_c2_c0, b_c1_c2_c1);
+    (int vt_c0_c0, int vt_c0_c1, int vt_c1_c0, int vt_c1_c1, int vt_c2_c0, int vt_c2_c1) = fp6MulByV(t1_c0_c0, t1_c0_c1, t1_c1_c0, t1_c1_c1, t1_c2_c0, t1_c2_c1);
+    (int c0_c0_c0, int c0_c0_c1, int c0_c1_c0, int c0_c1_c1, int c0_c2_c0, int c0_c2_c1) = fp6Add(t0_c0_c0, t0_c0_c1, t0_c1_c0, t0_c1_c1, t0_c2_c0, t0_c2_c1, vt_c0_c0, vt_c0_c1, vt_c1_c0, vt_c1_c1, vt_c2_c0, vt_c2_c1);
+    (int sa_c0_c0, int sa_c0_c1, int sa_c1_c0, int sa_c1_c1, int sa_c2_c0, int sa_c2_c1) = fp6Add(a_c0_c0_c0, a_c0_c0_c1, a_c0_c1_c0, a_c0_c1_c1, a_c0_c2_c0, a_c0_c2_c1, a_c1_c0_c0, a_c1_c0_c1, a_c1_c1_c0, a_c1_c1_c1, a_c1_c2_c0, a_c1_c2_c1);
+    (int sb_c0_c0, int sb_c0_c1, int sb_c1_c0, int sb_c1_c1, int sb_c2_c0, int sb_c2_c1) = fp6Add(b_c0_c0_c0, b_c0_c0_c1, b_c0_c1_c0, b_c0_c1_c1, b_c0_c2_c0, b_c0_c2_c1, b_c1_c0_c0, b_c1_c0_c1, b_c1_c1_c0, b_c1_c1_c1, b_c1_c2_c0, b_c1_c2_c1);
+    (int pr_c0_c0, int pr_c0_c1, int pr_c1_c0, int pr_c1_c1, int pr_c2_c0, int pr_c2_c1) = fp6Mul(sa_c0_c0, sa_c0_c1, sa_c1_c0, sa_c1_c1, sa_c2_c0, sa_c2_c1, sb_c0_c0, sb_c0_c1, sb_c1_c0, sb_c1_c1, sb_c2_c0, sb_c2_c1);
+    (int q_c0_c0, int q_c0_c1, int q_c1_c0, int q_c1_c1, int q_c2_c0, int q_c2_c1) = fp6Sub(pr_c0_c0, pr_c0_c1, pr_c1_c0, pr_c1_c1, pr_c2_c0, pr_c2_c1, t0_c0_c0, t0_c0_c1, t0_c1_c0, t0_c1_c1, t0_c2_c0, t0_c2_c1);
+    (int c1_c0_c0, int c1_c0_c1, int c1_c1_c0, int c1_c1_c1, int c1_c2_c0, int c1_c2_c1) = fp6Sub(q_c0_c0, q_c0_c1, q_c1_c0, q_c1_c1, q_c2_c0, q_c2_c1, t1_c0_c0, t1_c0_c1, t1_c1_c0, t1_c1_c1, t1_c2_c0, t1_c2_c1);
+    return c0_c0_c0, c0_c0_c1, c0_c1_c0, c0_c1_c1, c0_c2_c0, c0_c2_c1, c1_c0_c0, c1_c0_c1, c1_c1_c0, c1_c1_c1, c1_c2_c0, c1_c2_c1;
+}
+
+function fp12Sqr(int a_c0_c0_c0, int a_c0_c0_c1, int a_c0_c1_c0, int a_c0_c1_c1, int a_c0_c2_c0, int a_c0_c2_c1, int a_c1_c0_c0, int a_c1_c0_c1, int a_c1_c1_c0, int a_c1_c1_c1, int a_c1_c2_c0, int a_c1_c2_c1) returns (int, int, int, int, int, int, int, int, int, int, int, int) {
+    (int c_c0_c0_c0, int c_c0_c0_c1, int c_c0_c1_c0, int c_c0_c1_c1, int c_c0_c2_c0, int c_c0_c2_c1, int c_c1_c0_c0, int c_c1_c0_c1, int c_c1_c1_c0, int c_c1_c1_c1, int c_c1_c2_c0, int c_c1_c2_c1) = fp12Mul(a_c0_c0_c0, a_c0_c0_c1, a_c0_c1_c0, a_c0_c1_c1, a_c0_c2_c0, a_c0_c2_c1, a_c1_c0_c0, a_c1_c0_c1, a_c1_c1_c0, a_c1_c1_c1, a_c1_c2_c0, a_c1_c2_c1, a_c0_c0_c0, a_c0_c0_c1, a_c0_c1_c0, a_c0_c1_c1, a_c0_c2_c0, a_c0_c2_c1, a_c1_c0_c0, a_c1_c0_c1, a_c1_c1_c0, a_c1_c1_c1, a_c1_c2_c0, a_c1_c2_c1);
+    return c_c0_c0_c0, c_c0_c0_c1, c_c0_c1_c0, c_c0_c1_c1, c_c0_c2_c0, c_c0_c2_c1, c_c1_c0_c0, c_c1_c0_c1, c_c1_c1_c0, c_c1_c1_c1, c_c1_c2_c0, c_c1_c2_c1;
+}
+
+// conjugate over Fp12: (c0, -c1)
+function fp12Conj(int a_c0_c0_c0, int a_c0_c0_c1, int a_c0_c1_c0, int a_c0_c1_c1, int a_c0_c2_c0, int a_c0_c2_c1, int a_c1_c0_c0, int a_c1_c0_c1, int a_c1_c1_c0, int a_c1_c1_c1, int a_c1_c2_c0, int a_c1_c2_c1) returns (int, int, int, int, int, int, int, int, int, int, int, int) {
+    (int n_c0_c0, int n_c0_c1, int n_c1_c0, int n_c1_c1, int n_c2_c0, int n_c2_c1) = fp6Neg(a_c1_c0_c0, a_c1_c0_c1, a_c1_c1_c0, a_c1_c1_c1, a_c1_c2_c0, a_c1_c2_c1);
+    return a_c0_c0_c0, a_c0_c0_c1, a_c0_c1_c0, a_c0_c1_c1, a_c0_c2_c0, a_c0_c2_c1, n_c0_c0, n_c0_c1, n_c1_c0, n_c1_c1, n_c2_c0, n_c2_c1;
+}
+
+// inverse: den = c0^2 - v*c1^2;  t = fp6Inv(den);  (c0 t, -(c1 t))
+function fp12Inv(
+    int A0,int A1,int A2,int A3,int A4,int A5, int A6,int A7,int A8,int A9,int A10,int A11
+) returns (int,int,int,int,int,int,int,int,int,int,int,int) {
+    (int sc0_0,int sc0_1,int sc0_2,int sc0_3,int sc0_4,int sc0_5) = fp6Sqr(A0,A1,A2,A3,A4,A5);
+    (int sc1_0,int sc1_1,int sc1_2,int sc1_3,int sc1_4,int sc1_5) = fp6Sqr(A6,A7,A8,A9,A10,A11);
+    (int vc_0,int vc_1,int vc_2,int vc_3,int vc_4,int vc_5) = fp6MulByV(sc1_0,sc1_1,sc1_2,sc1_3,sc1_4,sc1_5);
+    (int dn_0,int dn_1,int dn_2,int dn_3,int dn_4,int dn_5) =
+        fp6Sub(sc0_0,sc0_1,sc0_2,sc0_3,sc0_4,sc0_5, vc_0,vc_1,vc_2,vc_3,vc_4,vc_5);
+    (int t_0,int t_1,int t_2,int t_3,int t_4,int t_5) = fp6Inv(dn_0,dn_1,dn_2,dn_3,dn_4,dn_5);
+    (int n0,int n1,int n2,int n3,int n4,int n5) =
+        fp6Mul(A0,A1,A2,A3,A4,A5, t_0,t_1,t_2,t_3,t_4,t_5);
+    (int p0,int p1,int p2,int p3,int p4,int p5) =
+        fp6Mul(A6,A7,A8,A9,A10,A11, t_0,t_1,t_2,t_3,t_4,t_5);
+    (int w0,int w1,int w2,int w3,int w4,int w5) = fp6Neg(p0,p1,p2,p3,p4,p5);
+    return n0,n1,n2,n3,n4,n5,w0,w1,w2,w3,w4,w5;
+}
+
+// Frobenius a -> a^(p^k), k = 1,2,3. FP6_C1/FP6_C2 and FP12_C1 are precomputed Fp2 constants.
+function fp12Frob1(
+    int A0,int A1,int A2,int A3,int A4,int A5, int A6,int A7,int A8,int A9,int A10,int A11
+) returns (int,int,int,int,int,int,int,int,int,int,int,int) {
+    (int c0,int c1,int c2,int c3,int c4,int c5) = fp6FrobOdd(
+        A0,A1,A2,A3,A4,A5,
+        21575463638280843010398324269430826099269044274347216827212613867836435027261, 10307601595873709700152284273816112264069230130616436755625194854815875713954,
+        2581911344467009335267311115468803099551665605076196740867805258568234346338, 19937756971775647987995932169929341994314640652964949448313374472400716661030);
+    (int g0,int g1,int g2,int g3,int g4,int g5) = fp6FrobOdd(
+        A6,A7,A8,A9,A10,A11,
+        21575463638280843010398324269430826099269044274347216827212613867836435027261, 10307601595873709700152284273816112264069230130616436755625194854815875713954,
+        2581911344467009335267311115468803099551665605076196740867805258568234346338, 19937756971775647987995932169929341994314640652964949448313374472400716661030);
+    (int f0,int f1,int f2,int f3,int f4,int f5) = fp6MulByFp2(
+        g0,g1,g2,g3,g4,g5,
+        8376118865763821496583973867626364092589906065868298776909617916018768340080, 16469823323077808223889137241176536799009286646108169935659301613961712198316);
+    return c0,c1,c2,c3,c4,c5,f0,f1,f2,f3,f4,f5;
+}
+function fp12Frob2(
+    int A0,int A1,int A2,int A3,int A4,int A5, int A6,int A7,int A8,int A9,int A10,int A11
+) returns (int,int,int,int,int,int,int,int,int,int,int,int) {
+    (int c0,int c1,int c2,int c3,int c4,int c5) = fp6FrobEven(
+        A0,A1,A2,A3,A4,A5,
+        21888242871839275220042445260109153167277707414472061641714758635765020556616, 0,
+        2203960485148121921418603742825762020974279258880205651966, 0);
+    (int g0,int g1,int g2,int g3,int g4,int g5) = fp6FrobEven(
+        A6,A7,A8,A9,A10,A11,
+        21888242871839275220042445260109153167277707414472061641714758635765020556616, 0,
+        2203960485148121921418603742825762020974279258880205651966, 0);
+    (int f0,int f1,int f2,int f3,int f4,int f5) = fp6MulByFp2(
+        g0,g1,g2,g3,g4,g5,
+        21888242871839275220042445260109153167277707414472061641714758635765020556617, 0);
+    return c0,c1,c2,c3,c4,c5,f0,f1,f2,f3,f4,f5;
+}
+function fp12Frob3(
+    int A0,int A1,int A2,int A3,int A4,int A5, int A6,int A7,int A8,int A9,int A10,int A11
+) returns (int,int,int,int,int,int,int,int,int,int,int,int) {
+    (int c0,int c1,int c2,int c3,int c4,int c5) = fp6FrobOdd(
+        A0,A1,A2,A3,A4,A5,
+        3772000881919853776433695186713858239009073593817195771773381919316419345261, 2236595495967245188281701248203181795121068902605861227855261137820944008926,
+        5324479202449903542726783395506214481928257762400643279780343368557297135718, 16208900380737693084919495127334387981393726419856888799917914180988844123039);
+    (int g0,int g1,int g2,int g3,int g4,int g5) = fp6FrobOdd(
+        A6,A7,A8,A9,A10,A11,
+        3772000881919853776433695186713858239009073593817195771773381919316419345261, 2236595495967245188281701248203181795121068902605861227855261137820944008926,
+        5324479202449903542726783395506214481928257762400643279780343368557297135718, 16208900380737693084919495127334387981393726419856888799917914180988844123039);
+    (int f0,int f1,int f2,int f3,int f4,int f5) = fp6MulByFp2(
+        g0,g1,g2,g3,g4,g5,
+        11697423496358154304825782922584725312912383441159505038794027105778954184319, 303847389135065887422783454877609941456349188919719272345083954437860409601);
+    return c0,c1,c2,c3,c4,c5,f0,f1,f2,f3,f4,f5;
+}

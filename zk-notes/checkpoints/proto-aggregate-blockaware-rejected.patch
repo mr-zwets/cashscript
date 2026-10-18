@@ -1,0 +1,83 @@
+diff --git a/packages/cashc/src/stack-rescheduling.ts b/packages/cashc/src/stack-rescheduling.ts
+index 06cfd1b2..66534db8 100644
+--- a/packages/cashc/src/stack-rescheduling.ts
++++ b/packages/cashc/src/stack-rescheduling.ts
+@@ -86,6 +86,7 @@ import {
+   scriptToBytecode,
+   sourceMapToLocationData,
+ } from '@cashscript/utils';
++import { collapsedBytes, Kind as BlockMoveKind } from './block-moves.js';
+ 
+ export interface FunctionArity { in: number; out: number }
+ 
+@@ -94,8 +95,15 @@ export interface RescheduleOptions {
+   mainInArity: number; // spend parameters + constructor parameters
+   objective: 'size' | 'opcost';
+   constructorParamLength: number;
++  // rank candidates by their size after block-move collapsing (see block-moves.ts)
++  blockAware?: BlockMoveKind[];
+ }
+ 
++// set for the duration of one applyStackRescheduling call
++let blockAwareKinds: BlockMoveKind[] | undefined;
++// which decisions are block-aware: per-block min only, body selection only, or both
++const blockAwareScope = (): string => process.env.CASHC_BLOCKAWARE_SCOPE ?? 'all';
++
+ export interface RescheduleOutcome {
+   result: OptimiseBytecodeResult;
+   frames: DebugFrame[];
+@@ -655,10 +663,11 @@ export function opCostEstimate(script: Script): number {
+   return cost;
+ }
+ 
+-const scriptCost = (script: Script, objective: 'size' | 'opcost'): number => (
++const scriptCost = (script: Script, objective: 'size' | 'opcost'): number => {
++  if (blockAwareKinds !== undefined && blockAwareScope() !== 'bodies') return collapsedBytes(script, blockAwareKinds) + opCostEstimate(script) * 1e-7;
+   // redeem bytes still cost 1 op each in the scriptSig push, which doubles as a tiebreak
+-  objective === 'opcost' ? opCostEstimate(script) + calculateBytesize(script) : calculateBytesize(script)
+-);
++  return objective === 'opcost' ? opCostEstimate(script) + calculateBytesize(script) : calculateBytesize(script);
++};
+ 
+ // ---------- per-script rescheduling ----------
+ 
+@@ -998,7 +1007,9 @@ function rescheduleBodies(
+       return;
+     }
+     const bodyCost = (candidate: Script, perm: number[] | undefined): number => (
+-      objective === 'opcost'
++      blockAwareKinds !== undefined && blockAwareScope() !== 'blocks'
++        ? collapsedBytes(candidate, blockAwareKinds) + opCostEstimate(candidate) * 1e-7
++        : objective === 'opcost'
+         ? measureBody(d, new Map([...overrides, [id, candidate]]), id, arity, perm)
+         : calculateBytesize(candidate)
+     );
+@@ -1008,7 +1019,7 @@ function rescheduleBodies(
+     let bestCost = Infinity;
+     // baseline: the untouched cashc body (only valid while its callees are unpermuted)
+     if (!calleesPermuted) {
+-      bestCost = objective === 'opcost' ? measureBody(d, overrides, id, arity, undefined) : calculateBytesize(original);
++      bestCost = blockAwareKinds !== undefined && blockAwareScope() !== 'blocks' ? bodyCost(original, undefined) : objective === 'opcost' ? measureBody(d, overrides, id, arity, undefined) : calculateBytesize(original);
+     }
+ 
+     const candidatesPerms = layouts ? layoutCandidates(original, arities, arity.in) : [undefined];
+@@ -1094,6 +1105,19 @@ export function applyStackRescheduling(
+   optimised: OptimiseBytecodeResult,
+   frames: DebugFrame[],
+   options: RescheduleOptions,
++): RescheduleOutcome {
++  blockAwareKinds = options.blockAware;
++  try {
++    return applyStackReschedulingImpl(optimised, frames, options);
++  } finally {
++    blockAwareKinds = undefined;
++  }
++}
++
++function applyStackReschedulingImpl(
++  optimised: OptimiseBytecodeResult,
++  frames: DebugFrame[],
++  options: RescheduleOptions,
+ ): RescheduleOutcome {
+   const { arities, objective, constructorParamLength } = options;
+   const d = dissect(optimised.script);

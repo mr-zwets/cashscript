@@ -1,0 +1,656 @@
+diff --git a/packages/cashc/src/compiler.ts b/packages/cashc/src/compiler.ts
+index 61a3b0d0..4bfd2f78 100644
+--- a/packages/cashc/src/compiler.ts
++++ b/packages/cashc/src/compiler.ts
+@@ -109,6 +109,9 @@ export interface InternalCompilerOptions extends CompilerOptions {
+   // Keep every function called from a loop OP_DEFINE'd (the pre-co-8 rule) instead of only those
+   // called inside a branch that repeats. For tests and tooling.
+   branchAwareLoopInlining?: boolean;
++  // With rescheduleStacks: choose every OP_DEFINE'd function's argument AND return layout by a
++  // whole-program search on total compiled bytes (see searchConventions). Default true.
++  callingConvention?: boolean;
+ }
+ 
+ export type ScopedReassignment = 'replace' | 'rename';
+@@ -179,7 +182,7 @@ function compileImpl(
+     // only to keep them out of the serialized artifact options
+     // eslint-disable-next-line @typescript-eslint/no-unused-vars
+     disableDefSinking, disableConstantHoisting, scopedReassignment, loopInversion, constantHoisting,
+-    branchAwareLoopInlining,
++    branchAwareLoopInlining, callingConvention,
+     ...artifactCompilerOptions
+   } = compilerOptions;
+   const mergedCompilerOptions = { ...DEFAULT_COMPILER_OPTIONS, ...artifactCompilerOptions };
+@@ -253,6 +256,7 @@ function compileImpl(
+       mainInArity: ast.contract!.functions[0].parameters.length + constructorParamLength,
+       objective: mergedCompilerOptions.optimizeFor ?? 'opcost',
+       constructorParamLength,
++      callingConvention: callingConvention ?? true,
+     }));
+     // The rescheduler re-emits blocks one at a time, so redundancies across block boundaries
+     // (OP_SWAP OP_SWAP, OP_DROP OP_DROP, ...) are left for a final pass of the main optimiser,
+diff --git a/packages/cashc/src/stack-rescheduling.ts b/packages/cashc/src/stack-rescheduling.ts
+index 06cfd1b2..0ba4d3a7 100644
+--- a/packages/cashc/src/stack-rescheduling.ts
++++ b/packages/cashc/src/stack-rescheduling.ts
+@@ -94,8 +94,16 @@ export interface RescheduleOptions {
+   mainInArity: number; // spend parameters + constructor parameters
+   objective: 'size' | 'opcost';
+   constructorParamLength: number;
++  // whole-program calling-convention search (argument AND return layouts), see searchConventions
++  callingConvention?: boolean;
+ }
+ 
++// Calling convention of one OP_DEFINE'd function. `in[j]` is the original argument index
++// held at stack position j (bottom -> top) on entry; `out[j]` the original return index
++// held at stack position j on exit. Undefined means the standard (source) order.
++export interface Convention { in?: number[]; out?: number[] }
++type Conventions = Map<number, Convention>;
++
+ export interface RescheduleOutcome {
+   result: OptimiseBytecodeResult;
+   frames: DebugFrame[];
+@@ -378,10 +386,17 @@ interface EmitState {
+   useCount: Map<string, number>;
+   remaining: Set<number>;
+   cost: number; // accumulated static op-cost of `out`
++  log: ScheduleStep[]; // computed nodes in emission order (feeds the convention search)
++  pre?: string[]; // stack labels just before the exit layout was assembled
+ }
+ 
++// one computed node of an emitted schedule: the stack (labels) just before its operands
++// were staged, and its operand keys
++interface ScheduleStep { node: DagNode; stk: string[]; keys: (string | undefined)[]; lastUse: boolean[] }
++
+ const cloneState = (s: EmitState): EmitState => ({
+   out: [...s.out], stk: [...s.stk], useCount: new Map(s.useCount), remaining: new Set(s.remaining), cost: s.cost,
++  log: [...s.log], pre: s.pre,
+ });
+ 
+ const appendOp = (s: EmitState, el: OpOrData): void => {
+@@ -431,31 +446,43 @@ function bringRef(s: EmitState, ref: Ref, consumeContext: boolean, exitNeed: Map
+ 
+ // compute one DAG node on top of the stack, staging arguments in the callee's chosen
+ // entry order for permuted OP_INVOKE targets
+-function computeNode(s: EmitState, node: DagNode, exitNeed: Map<string, number>, calleePerms: Map<number, number[]>): void {
++function computeNode(s: EmitState, node: DagNode, exitNeed: Map<string, number>, calleeConv: Conventions): void {
+   s.remaining.delete(node.id);
+-  const perm = node.kind === 'invoke' ? calleePerms.get(node.code) : undefined;
+-  const staged = perm !== undefined ? perm.map((i) => node.ins[i]) : node.ins;
++  const conv = node.kind === 'invoke' ? calleeConv.get(node.code) : undefined;
++  const keys = node.ins.map(keyOf);
++  s.log.push({
++    node,
++    stk: [...s.stk],
++    keys,
++    lastUse: keys.map((k) => k !== undefined && (s.useCount.get(k) ?? 0) <= 1 && (exitNeed.get(k) ?? 0) === 0),
++  });
++  const staged = conv?.in !== undefined ? conv.in.map((i) => node.ins[i]) : node.ins;
+   staged.forEach((r) => bringRef(s, r, true, exitNeed));
+   if (node.kind === 'invoke') { pushNum(s, node.code); appendOp(s, Op.OP_INVOKE); } else appendOp(s, node.code);
+   s.stk.length -= node.ins.length;
+-  for (let j = 0; j < node.nout; j += 1) s.stk.push(`n${node.id}_${j}`);
++  // a callee with a permuted return layout leaves original output out[j] at position j
++  for (let j = 0; j < node.nout; j += 1) s.stk.push(`n${node.id}_${conv?.out !== undefined ? conv.out[j] : j}`);
+ }
+ 
+ interface EmitOptions {
+   entrySeed?: string[]; // stack labels at block entry, bottom -> top (defaults to m0..mN-1)
+-  calleePerms?: Map<number, number[]>;
++  exitPerm?: number[]; // permuted exit layout of the main stack: position j receives exit[perm[j]]
++  calleeConv?: Conventions;
+ }
+ 
+-const NO_PERMS: Map<number, number[]> = new Map();
++const NO_CONV: Conventions = new Map();
+ const BEAM_WIDTH = 4;
+ const BEAM_EXPAND = 3;
+ 
+ // Re-emit one block: seed the entry slots, compute the DAG nodes in a strategy-chosen
+ // dependency order (fetching each operand with the cheapest available move/copy), then
+ // assemble the exact exit layout and clean leftover slots.
+-function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions = {}): Script {
+-  const { entryDepth: n, entryAlt: p, exit, exitAlt } = block;
+-  const calleePerms = options.calleePerms ?? NO_PERMS;
++interface EmittedBlock { script: Script; log: ScheduleStep[]; pre?: string[] }
++
++function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions = {}): EmittedBlock {
++  const { entryDepth: n, entryAlt: p, exitAlt } = block;
++  const exit = options.exitPerm !== undefined ? options.exitPerm.map((i) => block.exit[i]) : block.exit;
++  const calleePerms = options.calleeConv ?? NO_CONV;
+ 
+   // topo order of needed nodes (memoised — the DAGs share subtrees heavily)
+   const visited = new Set<number>();
+@@ -483,7 +510,7 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+   [...exit, ...exitAlt].forEach((r) => bump(exitNeed, keyOf(r)));
+ 
+   const initial: EmitState = {
+-    out: [], stk: [], useCount, remaining: new Set(order.map((nd) => nd.id)), cost: 0,
++    out: [], stk: [], useCount, remaining: new Set(order.map((nd) => nd.id)), cost: 0, log: [],
+   };
+   for (let i = 0; i < n; i += 1) initial.stk.push(options.entrySeed?.[i] ?? `m${i}`);
+   if (!altPass) for (let i = 0; i < p; i += 1) { appendOp(initial, Op.OP_FROMALTSTACK); initial.stk.push(`a${p - 1 - i}`); }
+@@ -519,6 +546,7 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+   // assemble the exit layout on top (exit-main ++ reverse(exit-alt) unless alt passes
+   // through), clean buried junk, and restore the altstack
+   const finish = (s: EmitState): void => {
++    s.pre = [...s.stk];
+     const need = new Map(exitNeed);
+     const desired = altPass ? [...exit] : [...exit, ...[...exitAlt].reverse()];
+     const desiredKeys = desired.map((r) => (r.k === 'const' ? undefined : keyOf(r)));
+@@ -559,7 +587,7 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+       computeNode(state, node, exitNeed, calleePerms);
+     }
+     finish(state);
+-    return state.out;
++    return { script: state.out, log: state.log, pre: state.pre };
+   }
+ 
+   // beam search: expand each surviving state by its BEAM_EXPAND cheapest ready nodes,
+@@ -582,16 +610,16 @@ function emitBlock(block: BasicBlock, strategy: Strategy, options: EmitOptions =
+     next.sort((a, b) => a.cost - b.cost);
+     beam = next.slice(0, BEAM_WIDTH);
+   }
+-  let best: Script | undefined;
++  let best: EmitState | undefined;
+   let bestCost = Infinity;
+   beam.forEach((state) => {
+     finish(state);
+-    if (state.cost < bestCost) { bestCost = state.cost; best = state.out; }
++    if (state.cost < bestCost) { bestCost = state.cost; best = state; }
+   });
+   // A dead-ended beam means no complete schedule was found; initial.out would be a script that
+   // computed nothing, so fail closed — every caller catches and keeps the original body.
+   if (best === undefined) throw new Error('beam search dead-ended without a complete schedule');
+-  return best;
++  return { script: (best as EmitState).out, log: (best as EmitState).log, pre: (best as EmitState).pre };
+ }
+ 
+ // collapse adjacent single-item stack ops into their multi-item forms (all provably
+@@ -674,19 +702,29 @@ interface RecompiledScript {
+   script: Script;
+   mapping: ItemMapping[];
+   changed: boolean;
++  log: ScheduleStep[]; // schedules of the re-emitted blocks (raw blocks contribute nothing)
++  // the return layout the final block's schedule produces naturally (no exit shuffle)
++  naturalOut?: number[];
+ }
+ 
+ interface RecompileOptions {
+   entryPerm?: number[]; // permuted entry layout of the FIRST block (bottom -> top holds slot perm[j])
+-  calleePerms?: Map<number, number[]>;
++  exitPerm?: number[]; // permuted exit layout of the LAST block (a function body's return layout)
++  calleeConv?: Conventions;
++  // memo of emitted blocks (keyed by strategy, block position, layouts and the conventions of
++  // the callees the block invokes) — the convention search recompiles main many times
++  blockCache?: Map<string, EmittedBlock>;
+ }
+ 
+ const isIdentityPerm = (perm: number[] | undefined): boolean => perm === undefined || perm.every((v, i) => v === i);
++const isStandardConv = (conv: Convention | undefined): boolean => (
++  conv === undefined || (isIdentityPerm(conv.in) && isIdentityPerm(conv.out))
++);
+ 
+ // over ALL block nodes (not just exit-reachable ones): a dead invoke of a permuted callee
+ // still stages its arguments in the raw ops, which would be the wrong order
+-const blockInvokesPermuted = (block: BasicBlock, calleePerms: Map<number, number[]>): boolean => (
+-  calleePerms.size > 0 && block.nodes.some((nd) => nd.kind === 'invoke' && calleePerms.has(nd.code))
++const blockInvokesPermuted = (block: BasicBlock, calleeConv: Conventions): boolean => (
++  calleeConv.size > 0 && block.nodes.some((nd) => nd.kind === 'invoke' && !isStandardConv(calleeConv.get(nd.code)))
+ );
+ 
+ // A node unreachable from the block's exit stacks is dead computation: its result never
+@@ -716,13 +754,16 @@ function recompileScript(
+   objective: 'size' | 'opcost',
+   options: RecompileOptions = {},
+ ): RecompiledScript {
+-  const calleePerms = options.calleePerms ?? NO_PERMS;
++  const calleePerms = options.calleeConv ?? NO_CONV;
+   const items = decompile(script, arities, inArity);
+   const out: Script = [];
+   const mapping: ItemMapping[] = [];
++  const log: ScheduleStep[] = [];
++  let naturalOut: number[] | undefined;
+   let changed = false;
+   let firstBlock = true;
+-  items.forEach((item) => {
++  const lastIndex = items.length - 1;
++  items.forEach((item, itemIndex) => {
+     if ('ctrl' in item) {
+       mapping.push({
+         oldStart: item.index, oldEnd: item.index + 1, newStart: out.length, newEnd: out.length + 1, rewritten: false,
+@@ -734,19 +775,42 @@ function recompileScript(
+     const entryPerm = firstBlock ? options.entryPerm : undefined;
+     const entrySeed = entryPerm !== undefined ? entryPerm.map((slot) => `m${slot}`) : undefined;
+     firstBlock = false;
+-    // the plain-cashc block is only a valid candidate under the standard entry layout
++    const exitPerm = itemIndex === lastIndex && !isIdentityPerm(options.exitPerm) ? options.exitPerm : undefined;
++    if (exitPerm !== undefined && (block.exit.length !== exitPerm.length || block.exitAlt.length > 0)) {
++      throw new Error('return layout does not match the final block');
++    }
++    // the plain-cashc block is only a valid candidate under the standard entry/exit layout
+     // and standard callee conventions
+-    const rawValid = isIdentityPerm(entryPerm) && !blockInvokesPermuted(block, calleePerms);
++    const rawValid = isIdentityPerm(entryPerm) && exitPerm === undefined && !blockInvokesPermuted(block, calleePerms);
+     // a block with dead computation has no valid re-emission (see hasDeadComputation);
+     // if the original ops are not valid either, this whole variant is unusable
+     const dead = hasDeadComputation(block);
+     if (dead && !rawValid) throw new Error('dead computation in a block that cannot keep its original ops');
+     // per-block min(original, rescheduled): both reproduce the block's entry->exit
+     // transform AND its boundary layout, so they compose freely
+-    const mine = dead ? undefined : peephole(emitBlock(block, strategy, { entrySeed, calleePerms }));
++    let emitted: EmittedBlock | undefined;
++    if (!dead) {
++      const cacheKey = options.blockCache === undefined ? undefined : [
++        strategy, block.rawStart, block.rawEnd, (entryPerm ?? []).join(','), (exitPerm ?? []).join(','),
++        [...new Set(block.nodes.filter((nd) => nd.kind === 'invoke').map((nd) => nd.code))]
++          .map((c) => `${c}:${convKey(calleePerms.get(c))}`).join(';'),
++      ].join('|');
++      emitted = cacheKey === undefined ? undefined : options.blockCache!.get(cacheKey);
++      if (emitted === undefined) {
++        emitted = emitBlock(block, strategy, { entrySeed, exitPerm, calleeConv: calleePerms });
++        if (cacheKey !== undefined) options.blockCache!.set(cacheKey, emitted);
++      }
++    }
++    const mine = emitted === undefined ? undefined : peephole(emitted.script);
+     const useMine = mine !== undefined
+       && (!rawValid || scriptCost(mine, objective) < scriptCost(block.rawOps, objective));
+     const chosen = useMine ? mine! : block.rawOps;
++    if (useMine) emitted!.log.forEach((step) => log.push(step));
++    if (itemIndex === lastIndex && emitted?.pre !== undefined) {
++      const pre = emitted.pre;
++      const pos = block.exit.map((r) => { const k = keyOf(r); return k === undefined ? -1 : pre.lastIndexOf(k); });
++      naturalOut = block.exit.map((_, j) => j).sort((a, b) => (pos[a] - pos[b]) || (a - b));
++    }
+     mapping.push({
+       oldStart: block.rawStart,
+       oldEnd: block.rawEnd,
+@@ -757,7 +821,7 @@ function recompileScript(
+     chosen.forEach((el) => out.push(el));
+     if (useMine) changed = true;
+   });
+-  return { script: out, mapping, changed };
++  return { script: out, mapping, changed, log, naturalOut };
+ }
+ 
+ // ---------- OP_DEFINE table dissection ----------
+@@ -888,16 +952,30 @@ function runBody(
+ // The candidate (with all chosen overrides and its entry permutation) must reproduce the
+ // ORIGINAL body's output stack — original bodies all the way down, standard input order —
+ // on K random vectors.
++// reference (original-body) runs are deterministic per (program, function, vector): memoised
++const referenceRuns = new WeakMap<Dissected, Map<string, BodyRun>>();
++
++// (with a permuted return layout `out`, candidate position j must hold reference output out[j])
+ function bodyEquiv(
+   d: Dissected, overrides: Map<number, Script>, id: number,
+-  candidate: Script, arity: FunctionArity, perm: number[] | undefined, K = 3,
++  candidate: Script, arity: FunctionArity, perm: number[] | undefined, K = 3, out?: number[],
+ ): boolean {
+   for (let t = 0; t < K; t += 1) {
+     const inputs = Array.from({ length: arity.in }, (_, i) => rnd(i * 17 + t * 1009 + id));
+-    const reference = runBody(d, new Map(), id, inputs);
++    const refKey = `${id}:${t}`;
++    let reference = referenceRuns.get(d)?.get(refKey);
++    if (reference === undefined) {
++      reference = runBody(d, new Map(), id, inputs);
++      if (!referenceRuns.has(d)) referenceRuns.set(d, new Map());
++      referenceRuns.get(d)!.set(refKey, reference);
++    }
+     const candidateRun = runBody(d, new Map([...overrides, [id, candidate]]), id, inputs, perm);
+     if (reference.stack === undefined || candidateRun.stack === undefined) return false;
+-    if (reference.stack.join() !== candidateRun.stack.join()) return false;
++    if (reference.stack.length !== candidateRun.stack.length) return false;
++    const expected = out !== undefined && reference.stack.length === out.length
++      ? out.map((i) => reference.stack![i]) : reference.stack;
++    if (out !== undefined && reference.stack.length !== out.length) return false;
++    if (expected.join() !== candidateRun.stack.join()) return false;
+   }
+   return true;
+ }
+@@ -964,6 +1042,8 @@ function layoutCandidates(body: Script, arities: Map<number, FunctionArity>, inA
+ 
+ // ---------- body selection ----------
+ 
++const permsToConv = (perms: Map<number, number[]>): Conventions => new Map([...perms].map(([id, p]) => [id, { in: p }]));
++
+ const BODY_STRATEGIES: Strategy[] = ['topo', 'greedy', 'opcost'];
+ const MAIN_STRATEGIES: Strategy[] = ['topo', 'greedy', 'opcost'];
+ // adopt a non-identity entry layout only if it beats the best identity variant by >1%
+@@ -1018,7 +1098,7 @@ function rescheduleBodies(
+         let candidate: Script;
+         try {
+           candidate = reoptimiseBody(recompileScript(original, arities, arity.in, strategy, objective, {
+-            entryPerm: perm as number[] | undefined, calleePerms: perms,
++            entryPerm: perm as number[] | undefined, calleeConv: permsToConv(perms),
+           }).script);
+         } catch { return; }
+         const cost = bodyCost(candidate, identity ? undefined : (perm as number[]));
+@@ -1045,6 +1125,292 @@ function rescheduleBodies(
+   return { overrides, perms };
+ }
+ 
++// ---------- whole-program calling-convention search ----------
++//
++// The entry-layout search above picks each body's argument order in isolation (by the body's
++// own cost, callee-first). This pass treats the conventions of ALL OP_DEFINE'd functions as one
++// whole-program decision: each function gets an argument layout AND a return layout, chosen by
++// coordinate descent on the TOTAL compiled bytes (every body + main), so a convention that makes
++// a callee slightly larger but saves staging/unstaging at its call sites is adopted. Candidate
++// layouts come from the bodies themselves (layoutCandidates) and from the call sites: the order
++// in which arguments already lie on the caller's stack just before the call (moves first, then
++// copies), and the order in which the caller consumes the returned values (first-used on top).
++// Consume-vs-copy at every call site follows liveness inside the scheduler (bringRef). Every
++// candidate body is differentially tested against the original (with permuted inputs and
++// outputs); main relies on the structural per-block guarantee as before.
++
++interface BodyPick { script: Script; log: ScheduleStep[]; naturalOut: number[][] }
++interface MainPick { script: Script; mapping?: ItemMapping[]; log: ScheduleStep[] }
++
++const CONV_STRATEGIES: Strategy[] = ['topo', 'greedy', 'opcost', 'beam'];
++
++const defineBytes = (body: Script): number => {
++  const len = scriptToBytecode(body).length;
++  return len + (len < 76 ? 1 : len < 256 ? 2 : 3);
++};
++
++const convKey = (conv: Convention | undefined): string => (
++  isStandardConv(conv) ? '' : `${(conv!.in ?? []).join(',')}|${(conv!.out ?? []).join(',')}`
++);
++
++const normaliseConv = (conv: Convention): Convention | undefined => {
++  const out: Convention = {};
++  if (!isIdentityPerm(conv.in)) out.in = conv.in;
++  if (!isIdentityPerm(conv.out)) out.out = conv.out;
++  return out.in === undefined && out.out === undefined ? undefined : out;
++};
++
++function compileBodyUnder(
++  d: Dissected, arities: Map<number, FunctionArity>, objective: 'size' | 'opcost',
++  id: number, conv: Conventions, overrides: Map<number, Script>, cache: Map<string, BodyPick | null>,
++): BodyPick | undefined {
++  const arity = arities.get(id);
++  const original = d.bodies.get(id)!;
++  const own = conv.get(id);
++  const callees = bodyInvokes(original);
++  const key = `${id}#${convKey(own)}#${[...new Set(callees)].map((c) => `${c}:${convKey(conv.get(c))}`).join(';')}`;
++  if (cache.has(key)) return cache.get(key) ?? undefined;
++  if (arity === undefined) { cache.set(key, null); return undefined; }
++  const others = new Map(overrides);
++  others.delete(id);
++  const standard = isStandardConv(own) && callees.every((c) => isStandardConv(conv.get(c)));
++  // ranked by bytes (the score); each candidate is differentially tested, cheapest first
++  const candidates: { script: Script; log: ScheduleStep[]; cost: number; raw: boolean }[] = [];
++  const naturalOut: number[][] = [];
++  if (standard) candidates.push({ script: original, log: [], cost: calculateBytesize(original), raw: true });
++  let anyLog: ScheduleStep[] = [];
++  CONV_STRATEGIES.forEach((strategy) => {
++    let recompiled: RecompiledScript;
++    try {
++      recompiled = recompileScript(original, arities, arity.in, strategy, objective, {
++        entryPerm: own?.in, exitPerm: own?.out, calleeConv: conv,
++      });
++    } catch { return; }
++    if (anyLog.length === 0) anyLog = recompiled.log;
++    // (in original output indices: the order the schedule leaves them before the exit shuffle)
++    if (recompiled.naturalOut !== undefined) naturalOut.push(recompiled.naturalOut);
++    const candidate = reoptimiseBody(recompiled.script);
++    candidates.push({ script: candidate, log: recompiled.log, cost: calculateBytesize(candidate), raw: false });
++  });
++  candidates.sort((a, b) => a.cost - b.cost || (a.raw ? -1 : 0) - (b.raw ? -1 : 0));
++  let best: Script | undefined;
++  let bestLog: ScheduleStep[] = [];
++  for (const c of candidates) {
++    if (c.raw || bodyEquiv(d, others, id, c.script, arity, own?.in, 3, own?.out)) {
++      best = c.script; bestLog = c.log; break;
++    }
++  }
++  const pick = best === undefined ? null : { script: best, log: bestLog.length > 0 ? bestLog : anyLog, naturalOut };
++  cache.set(key, pick);
++  return pick ?? undefined;
++}
++
++function compileMainUnder(
++  d: Dissected, arities: Map<number, FunctionArity>, mainInArity: number, objective: 'size' | 'opcost',
++  conv: Conventions, cache: Map<string, MainPick | null>,
++  blockCache: Map<string, { script: Script; log: ScheduleStep[] }>,
++): MainPick | undefined {
++  const callees = [...new Set(bodyInvokes(d.main))];
++  const key = callees.map((c) => `${c}:${convKey(conv.get(c))}`).join(';');
++  if (cache.has(key)) return cache.get(key) ?? undefined;
++  const needsReemit = callees.some((c) => !isStandardConv(conv.get(c)));
++  let best: MainPick | undefined = needsReemit ? undefined : { script: d.main, log: [] };
++  let bestCost = needsReemit ? Infinity : scriptCost(d.main, objective);
++  let anyLog: ScheduleStep[] = [];
++  MAIN_STRATEGIES.forEach((strategy) => {
++    let candidate: RecompiledScript;
++    try {
++      candidate = recompileScript(d.main, arities, mainInArity, strategy, objective, { calleeConv: conv, blockCache });
++    } catch { return; }
++    if (anyLog.length === 0) anyLog = candidate.log;
++    const cost = scriptCost(candidate.script, objective);
++    if (cost < bestCost && candidate.changed) {
++      best = { script: candidate.script, mapping: candidate.mapping, log: candidate.log }; bestCost = cost;
++    }
++  });
++  if (best !== undefined && best.log.length === 0) best = { ...best, log: anyLog };
++  cache.set(key, best ?? null);
++  return best;
++}
++
++// argument layouts suggested by one call site: arguments that die here, in the order they
++// already lie on the caller's stack (deepest first), then copies / constants (both orders)
++function siteInCandidates(step: ScheduleStep): number[][] {
++  const moves: { i: number; pos: number }[] = [];
++  const copies: { i: number; pos: number }[] = [];
++  const consts: number[] = [];
++  const seen = new Set<string>();
++  step.keys.forEach((k, i) => {
++    if (k === undefined) { consts.push(i); return; }
++    const dup = seen.has(k);
++    seen.add(k);
++    if (step.lastUse[i] && !dup) moves.push({ i, pos: deepestIndex(step.stk, k) });
++    else copies.push({ i, pos: topmostIndex(step.stk, k) });
++  });
++  moves.sort((a, b) => a.pos - b.pos);
++  const copiesDeepFirst = [...copies].sort((a, b) => a.pos - b.pos);
++  const copiesShallowFirst = [...copies].sort((a, b) => b.pos - a.pos);
++  const m = moves.map((x) => x.i);
++  return [
++    [...m, ...copiesShallowFirst.map((x) => x.i), ...consts],
++    [...m, ...copiesDeepFirst.map((x) => x.i), ...consts],
++    [...copiesShallowFirst.map((x) => x.i), ...consts, ...m],
++  ];
++}
++
++// return layout suggested by how the caller consumes the results of `step`: values used
++// later go deeper; values consumed by the same node follow that node's staging order
++function siteOutCandidate(log: ScheduleStep[], index: number, conv: Conventions): number[] {
++  const { node } = log[index];
++  const rank = Array.from({ length: node.nout }, (_, j) => {
++    const key = `n${node.id}_${j}`;
++    for (let t = index + 1; t < log.length; t += 1) {
++      const step = log[t];
++      const i = step.keys.indexOf(key);
++      if (i < 0) continue;
++      const stagedIn = step.node.kind === 'invoke' ? conv.get(step.node.code)?.in : undefined;
++      const staged = stagedIn !== undefined ? stagedIn.indexOf(i) : i;
++      return { j, t, staged };
++    }
++    return { j, t: Infinity, staged: j };
++  });
++  rank.sort((a, b) => (b.t - a.t) || (a.staged - b.staged));
++  return rank.map((r) => r.j);
++}
++
++const dedupePerms = (perms: number[][], n: number): number[][] => {
++  const seen = new Set<string>();
++  return perms.filter((p) => {
++    if (p.length !== n || new Set(p).size !== n) return false;
++    const key = p.join(',');
++    if (seen.has(key)) return false;
++    seen.add(key);
++    return true;
++  });
++};
++
++interface ConventionSearchResult {
++  conv: Conventions;
++  overrides: Map<number, Script>;
++  main: MainPick;
++  totalBytes: number;
++}
++
++function searchConventions(
++  d: Dissected, arities: Map<number, FunctionArity>, mainInArity: number, objective: 'size' | 'opcost',
++  initial: Conventions, debug: boolean, mainArities: Map<number, FunctionArity>, passes = 2,
++): ConventionSearchResult | undefined {
++  const bodyCache = new Map<string, BodyPick | null>();
++  const mainCache = new Map<string, MainPick | null>();
++  const mainBlockCache = new Map<string, { script: Script; log: ScheduleStep[] }>();
++  const ids = calleeFirstOrder(d);
++  const callers = new Map<number, number[]>();
++  ids.forEach((g) => [...new Set(bodyInvokes(d.bodies.get(g)!))].forEach((f) => {
++    callers.set(f, [...(callers.get(f) ?? []), g]);
++  }));
++  const mainCallees = new Set(bodyInvokes(d.main));
++
++  let conv: Conventions = new Map(initial);
++  const picks = new Map<number, BodyPick>();
++  const overrides = new Map<number, Script>();
++  // initial state, callee-first (a body that cannot be compiled under `initial` aborts)
++  for (const id of ids) {
++    const pick = compileBodyUnder(d, arities, objective, id, conv, overrides, bodyCache);
++    if (pick === undefined) {
++      if (!isStandardConv(conv.get(id)) || bodyInvokes(d.bodies.get(id)!).some((c) => !isStandardConv(conv.get(c)))) return undefined;
++      continue;
++    }
++    picks.set(id, pick);
++    if (pick.script !== d.bodies.get(id)) overrides.set(id, pick.script);
++  }
++  let main = compileMainUnder(d, mainArities, mainInArity, objective, conv, mainCache, mainBlockCache);
++  if (main === undefined) return undefined;
++  const bodyBytes = (id: number): number => defineBytes(picks.get(id)?.script ?? d.bodies.get(id)!);
++  let total = ids.reduce((sum, id) => sum + bodyBytes(id), 0) + calculateBytesize(main.script);
++  if (debug) console.error(`[convention] initial total ${total}`); // eslint-disable-line no-console
++
++  for (let pass = 0; pass < passes; pass += 1) {
++    let improved = false;
++    for (const f of ids) {
++      const arity = arities.get(f);
++      if (arity === undefined || (arity.in < 2 && arity.out < 2)) continue;
++      // call sites of f in the current schedules
++      const sites: { log: ScheduleStep[]; index: number }[] = [];
++      const logs = [...(callers.get(f) ?? []).map((g) => picks.get(g)?.log ?? []), ...(mainCallees.has(f) ? [main!.log] : [])];
++      logs.forEach((log) => log.forEach((step, index) => {
++        if (step.node.kind === 'invoke' && step.node.code === f) sites.push({ log, index });
++      }));
++      const cur = conv.get(f);
++      const curIn = cur?.in ?? Array.from({ length: arity.in }, (_, i) => i);
++      const curOut = cur?.out ?? Array.from({ length: arity.out }, (_, i) => i);
++      const identityIn = Array.from({ length: arity.in }, (_, i) => i);
++      const identityOut = Array.from({ length: arity.out }, (_, i) => i);
++      const inCands = dedupePerms([
++        identityIn, ...layoutCandidates(d.bodies.get(f)!, arities, arity.in),
++        ...sites.flatMap((s) => siteInCandidates(s.log[s.index])),
++      ], arity.in);
++      const outCands = dedupePerms([
++        identityOut, [...identityOut].reverse(),
++        ...sites.map((s) => siteOutCandidate(s.log, s.index, conv)),
++        ...(picks.get(f)?.naturalOut ?? []),
++      ], arity.out);
++      const pairs: Convention[] = [
++        ...inCands.map((p) => ({ in: p, out: curOut })),
++        ...outCands.map((p) => ({ in: curIn, out: p })),
++        ...sites.map((s) => ({ in: siteInCandidates(s.log[s.index])[0], out: siteOutCandidate(s.log, s.index, conv) })),
++      ];
++      const tried = new Set<string>([convKey(cur)]);
++      const started = Date.now();
++      for (const raw of pairs) {
++        if (raw.in!.length !== arity.in || raw.out!.length !== arity.out) continue;
++        const cand = normaliseConv(raw);
++        const key = convKey(cand);
++        if (tried.has(key)) continue;
++        tried.add(key);
++        const nextConv = new Map(conv);
++        if (cand === undefined) nextConv.delete(f); else nextConv.set(f, cand);
++        // re-derive f, its direct callers, and main if it calls f
++        const nextPicks = new Map<number, BodyPick>();
++        const nextOverrides = new Map(overrides);
++        const fPick = compileBodyUnder(d, arities, objective, f, nextConv, overrides, bodyCache);
++        if (fPick === undefined) continue;
++        nextPicks.set(f, fPick);
++        if (fPick.script !== d.bodies.get(f)) nextOverrides.set(f, fPick.script); else nextOverrides.delete(f);
++        let ok = true;
++        for (const g of callers.get(f) ?? []) {
++          const gPick = compileBodyUnder(d, arities, objective, g, nextConv, nextOverrides, bodyCache);
++          if (gPick === undefined) { ok = false; break; }
++          nextPicks.set(g, gPick);
++        }
++        if (!ok) continue;
++        let nextMain: MainPick = main!;
++        if (mainCallees.has(f)) {
++          const m = compileMainUnder(d, mainArities, mainInArity, objective, nextConv, mainCache, mainBlockCache);
++          if (m === undefined) continue;
++          nextMain = m;
++        }
++        let nextTotal = total - calculateBytesize(main!.script) + calculateBytesize(nextMain.script);
++        nextPicks.forEach((pick, id) => { nextTotal += defineBytes(pick.script) - bodyBytes(id); });
++        if (debug && Date.now() - started > 0) console.error(`[convention]   f${f} try ${key || 'std'} -> ${nextTotal} (${Date.now() - started}ms)`); // eslint-disable-line no-console
++        if (nextTotal < total) {
++          if (debug) console.error(`[convention] f${f} ${key || 'std'}: ${total} -> ${nextTotal}`); // eslint-disable-line no-console
++          total = nextTotal;
++          conv = nextConv;
++          main = nextMain;
++          nextPicks.forEach((pick, id) => {
++            picks.set(id, pick);
++            if (pick.script !== d.bodies.get(id)) overrides.set(id, pick.script); else overrides.delete(id);
++          });
++          improved = true;
++        }
++      }
++    }
++    if (debug) console.error(`[convention] pass ${pass} total ${total}`); // eslint-disable-line no-console
++    if (!improved) break;
++  }
++  return { conv, overrides, main: main!, totalBytes: total };
++}
++
+ // ---------- debug-information remapping ----------
+ 
+ const mergeLocations = (locations: SingleLocationData[]): SingleLocationData => {
+@@ -1143,7 +1509,7 @@ export function applyStackRescheduling(
+     MAIN_STRATEGIES.forEach((strategy) => {
+       let candidate: RecompiledScript;
+       try {
+-        candidate = recompileScript(d.main, arities, options.mainInArity, strategy, objective, { calleePerms: perms });
++        candidate = recompileScript(d.main, arities, options.mainInArity, strategy, objective, { calleeConv: permsToConv(perms) });
+       } catch (e) {
+         if (debug) console.error(`[reschedule] main (${strategy}) failed: ${(e as Error).message}`); // eslint-disable-line no-console
+         return;
+@@ -1166,6 +1532,25 @@ export function applyStackRescheduling(
+     ({ overrides, perms } = rescheduleBodies(d, loggableArities, objective, false));
+   }
+ 
++  // 2b. whole-program calling conventions (argument + return layouts), adopted only when the
++  // total compiled size beats the per-body layout result above
++  if (options.callingConvention && layouts && optimised.logs.length === 0) {
++    const baselineTotal = d.order.reduce((sum, id) => sum + defineBytes(overrides.get(id) ?? d.bodies.get(id)!), 0)
++      + calculateBytesize(main);
++    const searched = searchConventions(d, loggableArities, options.mainInArity, objective, permsToConv(perms), debug, arities);
++    if (searched !== undefined) {
++      const searchedTotal = d.order.reduce((sum, id) => sum + defineBytes(searched.overrides.get(id) ?? d.bodies.get(id)!), 0)
++        + calculateBytesize(searched.main.script);
++      if (debug) console.error(`[convention] baseline ${baselineTotal} searched ${searchedTotal} (${searched.conv.size} conventions)`); // eslint-disable-line no-console
++      if (searchedTotal < baselineTotal) {
++        overrides = searched.overrides;
++        perms = new Map([...searched.conv].map(([id, c]) => [id, c.in ?? []]));
++        main = searched.main.script;
++        mainMapping = searched.main.mapping;
++      }
++    } else if (debug) console.error('[convention] search failed; keeping per-body layouts'); // eslint-disable-line no-console
++  }
++
+   if (debug) {
+     // eslint-disable-next-line no-console
+     console.error(`[reschedule] final: overrides=${overrides.size} perms=${perms.size} mainRewritten=${mainMapping !== undefined}`);
